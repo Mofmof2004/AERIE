@@ -46,6 +46,24 @@ impl EdgeList {
         }
         degrees
     }
+
+    /// Adjacency list: entry `i` holds the indices of the nodes linked to node `i`.
+    ///
+    /// Returns a vector of length `n`. Isolated nodes get an empty list.
+    /// Each link appears in both endpoints' lists, since the graph is undirected.
+    /// The order inside a list follows the order of `edges`, so do not rely on it.
+    /// Weights are ignored: this answers "who", not "how strongly".
+    pub fn neighbours(&self) -> Vec<Vec<usize>> {
+        let mut neighbours = vec![Vec::new(); self.n as usize];
+
+        // Push each endpoint into the other's list.
+        for edge in &self.edges {
+            neighbours[edge.src as usize].push(edge.dst as usize);
+            neighbours[edge.dst as usize].push(edge.src as usize);
+        }
+
+        neighbours
+    }
 }
 
 // Unit tests: compiled only by `cargo test`.
@@ -53,10 +71,10 @@ impl EdgeList {
 mod tests {
     use super::*;
 
-    #[test]
-    fn degrees_triangle_plus_isolated() {
-        // build the triangle 0-1-2 plus isolated node 3, all weights 1.0
-        let g = EdgeList {
+    /// Test fixture: triangle 0-1-2 plus isolated node 3, all weights 1.0.
+    /// Edge order (0,1), (1,2), (0,2) fixes the neighbour order the tests expect.
+    fn triangle_plus_isolated() -> EdgeList {
+        EdgeList {
             n: 4,
             edges: vec![
                 Edge {
@@ -75,8 +93,24 @@ mod tests {
                     weight: 1.0,
                 },
             ],
-        };
+        }
+    }
 
+    #[test]
+    fn degrees_triangle_plus_isolated() {
+        // Each triangle node has two links of weight 1.0; node 3 has none.
+        let g: EdgeList = triangle_plus_isolated();
         assert_eq!(g.degrees(), vec![2.0, 2.0, 2.0, 0.0]);
+    }
+
+    #[test]
+    fn neighbours_triangle_plus_isolated() {
+        // Hand trace: (0,1) -> [[1],[0],[],[]]; (1,2) -> [[1],[0,2],[1],[]];
+        // (0,2) -> [[1,2],[0,2],[1,0],[]]. Node 3 stays empty.
+        let g: EdgeList = triangle_plus_isolated();
+        assert_eq!(
+            g.neighbours(),
+            vec![vec![1, 2], vec![0, 2], vec![1, 0], vec![]]
+        );
     }
 }
