@@ -4,6 +4,7 @@
 //! This crate knows nothing about drones: nodes are plain indices.
 
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 
 /// One weighted link between two nodes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -64,6 +65,48 @@ impl EdgeList {
 
         neighbours
     }
+
+    /// Connected components by breadth-first search.
+    ///
+    /// Returns a vector of length `n`: entry `i` is the component number of node `i`.
+    /// Nodes that can reach each other share a number. Numbers start at 0 and follow
+    /// the order of discovery: the component of node 0 is 0, the next unvisited node
+    /// starts component 1, and so on. The number of components is the maximum + 1.
+    ///
+    /// Runs in O(N + M): each node enters the queue once, each link is seen twice.
+    pub fn components(&self) -> Vec<usize> {
+        // `None` marks unvisited nodes during BFS; every node is `Some` when it finishes.
+        let mut components: Vec<Option<usize>> = vec![None; self.n as usize];
+        // Built once: looking up neighbours inside the loop must be instant.
+        let neighbours = self.neighbours();
+        let mut component_count: usize = 0;
+        let mut queue = VecDeque::new();
+
+        // Every node not reached yet starts a new component.
+        for s in 0..self.n as usize {
+            if components[s].is_none() {
+                queue.push_back(s);
+                components[s] = Some(component_count);
+                // Mark nodes when they are pushed, not when popped,
+                // so no node is queued twice.
+                while let Some(u) = queue.pop_front() {
+                    for v in &neighbours[u] {
+                        if components[*v].is_none() {
+                            components[*v] = Some(component_count);
+                            queue.push_back(*v);
+                        }
+                    }
+                }
+                component_count += 1;
+            }
+        }
+        let mut result = Vec::new();
+        for slot in components {
+            // BFS visited every node, so every slot is Some
+            result.push(slot.unwrap());
+        }
+        result
+    }
 }
 
 // Unit tests: compiled only by `cargo test`.
@@ -112,5 +155,35 @@ mod tests {
             g.neighbours(),
             vec![vec![1, 2], vec![0, 2], vec![1, 0], vec![]]
         );
+    }
+
+    #[test]
+    fn components_triangle_plus_isolated() {
+        // BFS from node 0 reaches 1 and 2 (component 0); node 3 starts component 1.
+        let g: EdgeList = triangle_plus_isolated();
+        assert_eq!(g.components(), vec![0, 0, 0, 1]);
+    }
+
+    #[test]
+    fn components_interleaved() {
+        // Components whose members are not consecutive indices: {0, 3} and {1, 2}.
+        // BFS from node 0 reaches 3 (component 0); node 1 starts component 1 and reaches 2.
+        // Catches code that numbers nodes by position instead of by reachability.
+        let g = EdgeList {
+            n: 4,
+            edges: vec![
+                Edge {
+                    src: 0,
+                    dst: 3,
+                    weight: 1.0,
+                },
+                Edge {
+                    src: 1,
+                    dst: 2,
+                    weight: 1.0,
+                },
+            ],
+        };
+        assert_eq!(g.components(), vec![0, 1, 1, 0]);
     }
 }
