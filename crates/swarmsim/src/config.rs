@@ -18,6 +18,12 @@ pub struct SimConfig {
     pub arena_w: f64,
     /// Arena height (y), km. Plan: 20.
     pub arena_h: f64,
+    /// Width of one squad cell, km. The arena is cut into a grid of cells and each
+    /// squad is centred in one cell. Must divide `arena_w` exactly.
+    pub cell_width: f64,
+    /// Height of one squad cell, km. Must divide `arena_h` exactly.
+    /// The grid must have exactly `n_squads` cells: (arena_w / cell_width) * (arena_h / cell_height).
+    pub cell_height: f64,
     /// Radio range of recon, RF sensing and compute drones, km. Plan: 5.
     pub range_short: f64,
     /// Radio range of relay drones, km. Plan: 9.
@@ -36,6 +42,8 @@ impl Default for SimConfig {
             squad_size: 10,
             arena_w: 40.0,
             arena_h: 20.0,
+            cell_width: 8.0,
+            cell_height: 10.0,
             range_short: 5.0,
             range_long: 9.0,
             squad_spread: 1.0,
@@ -57,6 +65,37 @@ mod tests {
             cfg.range_long > cfg.range_short,
             "relays must reach further"
         );
+    }
+
+    /// True when `whole / part` is a whole number (within float tolerance).
+    fn divides(part: f64, whole: f64) -> bool {
+        let ratio = whole / part;
+        (ratio - ratio.round()).abs() < 1e-9
+    }
+
+    #[test]
+    fn cells_divide_the_arena() {
+        let cfg = SimConfig::default();
+        assert!(
+            divides(cfg.cell_width, cfg.arena_w),
+            "cell_width {} does not divide arena_w {}",
+            cfg.cell_width,
+            cfg.arena_w
+        );
+        assert!(
+            divides(cfg.cell_height, cfg.arena_h),
+            "cell_height {} does not divide arena_h {}",
+            cfg.cell_height,
+            cfg.arena_h
+        );
+    }
+
+    #[test]
+    fn one_cell_per_squad() {
+        let cfg = SimConfig::default();
+        let cols = (cfg.arena_w / cfg.cell_width).round() as usize;
+        let rows = (cfg.arena_h / cfg.cell_height).round() as usize;
+        assert_eq!(cols * rows, cfg.n_squads, "grid is {cols} x {rows}");
     }
 
     #[test]
