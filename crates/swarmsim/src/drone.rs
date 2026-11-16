@@ -1,3 +1,4 @@
+use crate::config::SimConfig;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -23,6 +24,15 @@ impl Role {
             Role::Compute => [0.0, 0.0, 0.0, 1.0],
         }
     }
+
+    /// How far this drone's radio reaches, in km. Relays get the long range,
+    /// every other role the short one. Read from the config, never stored on the drone.
+    pub fn radio_range(self, config: &SimConfig) -> f64 {
+        match self {
+            Role::Recon | Role::RfSensing | Role::Compute => config.range_short,
+            Role::Relay => config.range_long,
+        }
+    }
 }
 
 /// A 2D point or vector in the arena, in km (velocities in km per step).
@@ -44,7 +54,7 @@ impl Vec2 {
         let x_squared: f64 = x_diff * x_diff;
         let y_squared: f64 = y_diff * y_diff;
 
-        (x_squared + y_squared).powf(0.5)
+        (x_squared + y_squared).sqrt()
     }
 }
 
@@ -98,6 +108,21 @@ mod tests {
         // And it reads back to the same value.
         let back: Role = serde_json::from_str("\"RfSensing\"").unwrap();
         assert_eq!(back, Role::RfSensing);
+    }
+
+    #[test]
+    fn radio_range_by_role() {
+        let cfg = SimConfig::default();
+        assert_eq!(Role::Relay.radio_range(&cfg), 9.0);
+        for role in [Role::Recon, Role::RfSensing, Role::Compute] {
+            assert_eq!(role.radio_range(&cfg), 5.0, "{role:?}");
+        }
+        // The range follows the config, so experiments can change it.
+        let long_relays = SimConfig {
+            range_long: 12.0,
+            ..Default::default()
+        };
+        assert_eq!(Role::Relay.radio_range(&long_relays), 12.0);
     }
 
     #[test]
