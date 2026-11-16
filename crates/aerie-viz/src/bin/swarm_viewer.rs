@@ -1,14 +1,9 @@
 //! AERIE viewer: an interactive window onto SwarmSim swarms.
 //!
-//! Run with `cargo run --release -p aerie-viz`.
+//! Run with `cargo run --release -p aerie-viz` (the default GUI)
+//! or `cargo run --release -p aerie-viz --bin swarm_viewer`.
 //! Left panel: mission, scenario and layers. Centre: the arena map
 //! (scroll to zoom, drag to pan, click a drone). Right panel: details.
-
-mod map;
-mod mission;
-mod style;
-
-use std::collections::BTreeMap;
 
 use eframe::egui::{self, RichText};
 use rand::SeedableRng;
@@ -17,9 +12,10 @@ use swarmsim::config::SimConfig;
 use swarmsim::drone::{Drone, Role};
 use swarmsim::spawn::spawn_swarm;
 
-use map::{ColorBy, Layers, MapView, RangeCircles};
-use mission::Mission;
-use style::{ramp, role_color, role_name, role_shape_name, squad_color, swatch};
+use aerie_viz::map::{self, ColorBy, Layers, MapView, RangeCircles};
+use aerie_viz::mission::Mission;
+use aerie_viz::squads::{SquadInfo, cell_count, cell_options, squad_infos};
+use aerie_viz::style::{ramp, role_color, role_name, role_shape_name, squad_color, swatch};
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -33,21 +29,6 @@ fn main() -> eframe::Result {
         options,
         Box::new(|_cc| Ok(Box::new(Viewer::default()))),
     )
-}
-
-/// Summary of one squad, recomputed whenever the swarm changes.
-pub struct SquadInfo {
-    pub squad: usize,
-    /// Indices into the swarm vector.
-    pub members: Vec<usize>,
-    /// Mean position of the members, km.
-    pub centroid: (f64, f64),
-    /// Distance from the centroid to the furthest member, km.
-    pub footprint: f64,
-    /// Distance to the closest other squad centroid, km.
-    pub nearest_other: Option<f64>,
-    /// Members per role, in the order of `Role::ALL`.
-    pub role_counts: [usize; 4],
 }
 
 struct Viewer {
@@ -421,104 +402,9 @@ impl Viewer {
     }
 }
 
-/// Number of cells in the grid for a cell size.
-fn cell_count(cfg: &SimConfig, w: f64, h: f64) -> usize {
-    ((cfg.arena_w / w).round() as usize) * ((cfg.arena_h / h).round() as usize)
-}
-
-/// Cell sizes that divide the arena exactly and leave room for one squad each.
-fn cell_options(cfg: &SimConfig) -> Vec<(f64, f64)> {
-    let divides = |part: f64, whole: f64| {
-        let r = whole / part;
-        (r - r.round()).abs() < 1e-9
-    };
-    let mut options = Vec::new();
-    for w in [2.0, 4.0, 5.0, 8.0, 10.0, 20.0, 40.0] {
-        for h in [2.0, 4.0, 5.0, 10.0, 20.0] {
-            if divides(w, cfg.arena_w) && divides(h, cfg.arena_h) {
-                options.push((w, h));
-            }
-        }
-    }
-    options
-}
-
-/// Groups the swarm by squad and computes each squad's summary.
-fn squad_infos(swarm: &[Drone]) -> Vec<SquadInfo> {
-    let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-    for (i, d) in swarm.iter().enumerate() {
-        groups.entry(d.squad.0 as usize).or_default().push(i);
-    }
-
-    let mut infos: Vec<SquadInfo> = groups
-        .into_iter()
-        .map(|(squad, members)| {
-            let n = members.len() as f64;
-            let cx = members.iter().map(|&i| swarm[i].position.x).sum::<f64>() / n;
-            let cy = members.iter().map(|&i| swarm[i].position.y).sum::<f64>() / n;
-            let footprint = members
-                .iter()
-                .map(|&i| (swarm[i].position.x - cx).hypot(swarm[i].position.y - cy))
-                .fold(0.0, f64::max);
-            let mut role_counts = [0; 4];
-            for &i in &members {
-                let k = Role::ALL
-                    .iter()
-                    .position(|&r| r == swarm[i].role)
-                    .unwrap_or(0);
-                role_counts[k] += 1;
-            }
-            SquadInfo {
-                squad,
-                members,
-                centroid: (cx, cy),
-                footprint,
-                nearest_other: None,
-                role_counts,
-            }
-        })
-        .collect();
-
-    let centroids: Vec<(f64, f64)> = infos.iter().map(|s| s.centroid).collect();
-    for (k, s) in infos.iter_mut().enumerate() {
-        s.nearest_other = centroids
-            .iter()
-            .enumerate()
-            .filter(|&(j, _)| j != k)
-            .map(|(_, c)| (c.0 - s.centroid.0).hypot(c.1 - s.centroid.1))
-            .min_by(f64::total_cmp);
-    }
-    infos
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn cell_options_all_divide_the_arena() {
-        let cfg = SimConfig::default();
-        let options = cell_options(&cfg);
-        assert!(options.contains(&(cfg.cell_width, cfg.cell_height)));
-        for (w, h) in options {
-            assert_eq!((cfg.arena_w / w).fract(), 0.0);
-            assert_eq!((cfg.arena_h / h).fract(), 0.0);
-        }
-    }
-
-    #[test]
-    fn squad_infos_cover_every_drone_once() {
-        let cfg = SimConfig::default();
-        let swarm = spawn_swarm(&cfg, &mut ChaCha8Rng::seed_from_u64(0));
-        let infos = squad_infos(&swarm);
-        assert_eq!(infos.len(), cfg.n_squads);
-        let total: usize = infos.iter().map(|s| s.members.len()).sum();
-        assert_eq!(total, swarm.len());
-        for s in &infos {
-            assert_eq!(s.role_counts.iter().sum::<usize>(), s.members.len());
-            assert!(s.nearest_other.is_some());
-        }
-    }
 
     #[test]
     fn viewer_starts_and_regenerates_on_change() {

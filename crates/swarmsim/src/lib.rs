@@ -3,3 +3,4 @@
 pub mod config;
 pub mod drone;
 pub mod spawn;
+pub mod graphs;

@@ -6,7 +6,7 @@ use eframe::egui::{
 use swarmsim::config::SimConfig;
 use swarmsim::drone::{Drone, Role};
 
-use crate::SquadInfo;
+use crate::squads::SquadInfo;
 use crate::style::{draw_drone, ramp, role_color, role_name, squad_color};
 
 /// What the drone fill colour encodes. The shape always encodes the role.
