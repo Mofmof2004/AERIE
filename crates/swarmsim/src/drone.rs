@@ -25,6 +25,29 @@ impl Role {
     }
 }
 
+/// A 2D point or vector in the arena, in km (velocities in km per step).
+/// `Copy` because it is a small value, like a number.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Vec2 {
+    /// Along the valley, 0 to `arena_w`.
+    pub x: f64,
+    /// Across the valley, 0 to `arena_h`.
+    pub y: f64,
+}
+
+impl Vec2 {
+    /// Euclidean distance to `other`, in km.
+    pub fn dist(self, other: Vec2) -> f64 {
+        let y_diff: f64 = self.y - other.y;
+        let x_diff: f64 = self.x - other.x;
+
+        let x_squared: f64 = x_diff * x_diff;
+        let y_squared: f64 = y_diff * y_diff;
+
+        (x_squared + y_squared).powf(0.5)
+    }
+}
+
 // Unit tests: compiled only by `cargo test`.
 #[cfg(test)]
 mod tests {
@@ -75,5 +98,20 @@ mod tests {
         // And it reads back to the same value.
         let back: Role = serde_json::from_str("\"RfSensing\"").unwrap();
         assert_eq!(back, Role::RfSensing);
+    }
+
+    #[test]
+    fn dist_three_four_five() {
+        let a = Vec2 { x: 0.0, y: 0.0 };
+        let b = Vec2 { x: 3.0, y: 4.0 };
+        assert!((a.dist(b) - 5.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn dist_is_symmetric_and_zero_to_self() {
+        let a = Vec2 { x: 1.5, y: -2.0 };
+        let b = Vec2 { x: 7.25, y: 3.0 };
+        assert_eq!(a.dist(b), b.dist(a));
+        assert_eq!(a.dist(a), 0.0);
     }
 }
