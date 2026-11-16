@@ -22,13 +22,14 @@ pub struct SimConfig {
     /// squad is centred in one cell. Must divide `arena_w` exactly.
     pub cell_width: f64,
     /// Height of one squad cell, km. Must divide `arena_h` exactly.
-    /// The grid must have exactly `n_squads` cells: (arena_w / cell_width) * (arena_h / cell_height).
+    /// The grid needs at least `n_squads` cells: each squad gets a different random cell.
     pub cell_height: f64,
     /// Radio range of recon, RF sensing and compute drones, km. Plan: 5.
     pub range_short: f64,
     /// Radio range of relay drones, km. Plan: 9.
     pub range_long: f64,
-    /// Standard deviation of a drone's offset from its squad centre, per axis, km.
+    /// Half-width of the square around the squad centre where members are placed,
+    /// uniformly, km. A member is at most `squad_spread` from the centre on each axis.
     /// Main knob for mean degree and cross-squad links. Tuned in step 1.
     pub squad_spread: f64,
     /// k for the kNN graph. With the union rule each drone gets between k and 2k links.
@@ -42,8 +43,8 @@ impl Default for SimConfig {
             squad_size: 10,
             arena_w: 40.0,
             arena_h: 20.0,
-            cell_width: 8.0,
-            cell_height: 10.0,
+            cell_width: 5.0,
+            cell_height: 5.0,
             range_short: 5.0,
             range_long: 9.0,
             squad_spread: 1.0,
@@ -91,11 +92,18 @@ mod tests {
     }
 
     #[test]
-    fn one_cell_per_squad() {
+    fn enough_cells_for_every_squad() {
+        // spawn_swarm gives each squad a different random cell. With fewer cells
+        // than squads its search for a free cell would never end.
         let cfg = SimConfig::default();
         let cols = (cfg.arena_w / cfg.cell_width).round() as usize;
         let rows = (cfg.arena_h / cfg.cell_height).round() as usize;
-        assert_eq!(cols * rows, cfg.n_squads, "grid is {cols} x {rows}");
+        assert!(
+            cols * rows >= cfg.n_squads,
+            "grid is {cols} x {rows} = {} cells for {} squads",
+            cols * rows,
+            cfg.n_squads
+        );
     }
 
     #[test]

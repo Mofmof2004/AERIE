@@ -1,0 +1,11 @@
+[package]
+name = "aerie-viz"
+version = "0.1.0"
+edition.workspace = true
+description = "Interactive window to look at SwarmSim swarms and, later, every mission's results."
+
+[dependencies]
+swarmsim = { path = "../swarmsim" }
+eframe = { workspace = true }
+rand = { workspace = true }
+rand_chacha = { workspace = true }

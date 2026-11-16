@@ -11,6 +11,7 @@ rand_chacha = "0.10.0"
 rand_distr = "0.6.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+eframe = "0.37.0"          # native GUI window + egui, used only by aerie-viz
 
 [profile.dev.package."*"]  # build settings
 opt-level = 3              # optimize dependencies even in debug builds
