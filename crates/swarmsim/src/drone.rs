@@ -76,6 +76,31 @@ pub struct Drone {
     pub compute_capacity: f64,
 }
 
+impl Drone {
+    /// A drone on station with the default settings for its role:
+    /// zero velocity, full battery, perfect sensor, and compute capacity
+    /// high for compute drones and low for every other role.
+    ///
+    /// `spawn_swarm` then overwrites the fields it randomizes.
+    pub fn new(id: DroneId, squad: SquadId, role: Role, position: Vec2) -> Self {
+        let compute_capacity = match role {
+            Role::Compute => 1.0,
+            Role::Recon | Role::RfSensing | Role::Relay => 0.2,
+        };
+
+        Drone {
+            id,
+            squad,
+            role,
+            position,
+            velocity: Vec2 { x: 0.0, y: 0.0 },
+            battery: 1.0,
+            sensor_quality: 1.0,
+            compute_capacity,
+        }
+    }
+}
+
 impl Vec2 {
     /// Euclidean distance to `other`, in km.
     pub fn dist(self, other: Vec2) -> f64 {
@@ -161,6 +186,22 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(Role::Relay.radio_range(&long_relays), 12.0);
+    }
+
+    #[test]
+    fn new_drone_has_role_defaults() {
+        let pos = Vec2 { x: 4.0, y: 5.0 };
+        for role in Role::ALL {
+            let d = Drone::new(DroneId(7), SquadId(1), role, pos);
+            assert_eq!(d.id, DroneId(7));
+            assert_eq!(d.squad, SquadId(1));
+            assert_eq!(d.role, role);
+            assert_eq!(d.position, pos);
+            assert_eq!(d.velocity, Vec2 { x: 0.0, y: 0.0 }, "on station");
+            assert_eq!(d.battery, 1.0);
+            let expected_compute = if role == Role::Compute { 1.0 } else { 0.2 };
+            assert_eq!(d.compute_capacity, expected_compute, "{role:?}");
+        }
     }
 
     #[test]
