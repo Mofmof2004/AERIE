@@ -7,6 +7,8 @@
 //! Add jammer (click), Draw ridge (drag from one end to the other).
 //! Right-click a jammer or the ridge to delete it. Scroll to zoom.
 //! Optional swarm layer: which drones are jammed and which links fail (previews 2c / 2d).
+//! "Place from seed" runs `place_jamming` on the chosen seed's swarm, exactly as the
+//! dataset will: spawn the swarm, then place jammer and ridge with the same RNG.
 
 use aerie_graph::EdgeList;
 use eframe::egui::{
@@ -19,7 +21,7 @@ use swarmsim::config::SimConfig;
 use swarmsim::drone::{Drone, Vec2};
 use swarmsim::graphs::epsilon::epsilon_graph;
 use swarmsim::graphs::stats::stats;
-use swarmsim::jamming::{Jammer, Ridge, jam_power};
+use swarmsim::jamming::{Jammer, Ridge, jam_power, place_jamming};
 use swarmsim::spawn::spawn_swarm;
 
 use aerie_viz::style::{draw_drone, role_color, role_name};
@@ -88,6 +90,7 @@ struct HeatKey {
     d0: f64,
     factor: f64,
     threshold: f64,
+    p0: f64,
     combine: Combine,
     scale: Scale,
     contours: bool,
@@ -100,7 +103,6 @@ struct JamApp {
     tool: Tool,
     combine: Combine,
     scale: Scale,
-    new_power: f64,
     snap: bool,
     selected: Option<usize>,
     drag: Option<Drag>,
@@ -123,6 +125,12 @@ struct JamApp {
     swarm: Vec<Drone>,
     graph: EdgeList,
     swarm_seed: Option<u64>,
+    /// Re-run `place_jamming` whenever the seed changes.
+    auto_place: bool,
+    /// The seed the last `place_jamming` run was for (to warn when the seed moved on).
+    placed_for: Option<u64>,
+    /// Message from the last placement (success or failure).
+    place_msg: Option<String>,
 
     // Heatmap texture cache.
     heat: Option<TextureHandle>,
@@ -138,7 +146,6 @@ impl Default for JamApp {
             tool: Tool::Move,
             combine: Combine::Sum,
             scale: Scale::Linear,
-            new_power: 1.0,
             snap: true,
             selected: None,
             drag: None,
@@ -157,6 +164,9 @@ impl Default for JamApp {
                 edges: Vec::new(),
             },
             swarm_seed: None,
+            auto_place: false,
+            placed_for: None,
+            place_msg: None,
             heat: None,
             heat_key: None,
         };
@@ -238,6 +248,12 @@ impl JamApp {
         }
     }
 
+    /// The jammed threshold in absolute power: `jam_threshold` is a fraction of P0,
+    /// exactly as in `place_jamming`.
+    fn threshold(&self) -> f64 {
+        self.config.jam_threshold * self.config.jam_p0
+    }
+
     /// Respawns the swarm and its epsilon graph when the seed changes.
     fn update_swarm(&mut self) {
         if self.swarm_seed == Some(self.seed) {
@@ -253,7 +269,7 @@ impl JamApp {
     fn jammed(&self) -> Vec<bool> {
         self.swarm
             .iter()
-            .map(|d| self.total_power(d.position) >= self.config.jam_threshold)
+            .map(|d| self.total_power(d.position) >= self.threshold())
             .collect()
     }
 
@@ -285,6 +301,53 @@ impl JamApp {
         self.selected = Some(0);
     }
 
+    /// Spawns the swarm for `self.seed` and places one jammer and one ridge with
+    /// `place_jamming`, using the same RNG after the spawn (as the dataset will).
+    /// `place_jamming` panics when no placement works (for example with the jammed
+    /// threshold slider at 1.0); the GUI catches that and shows a message instead.
+    fn place_from_seed(&mut self) {
+        let mut rng = ChaCha8Rng::seed_from_u64(self.seed);
+        let swarm = spawn_swarm(&self.config, &mut rng);
+        let config = self.config;
+        // Silence the panic message while trying: the GUI shows its own.
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            place_jamming(&swarm, &config, &mut rng)
+        }));
+        std::panic::set_hook(previous_hook);
+        self.graph = epsilon_graph(&swarm, &self.config);
+        self.swarm = swarm;
+        self.swarm_seed = Some(self.seed);
+        self.show_swarm = true;
+        match result {
+            Ok((jammer, ridge)) => {
+                self.jammers = vec![jammer];
+                self.ridge = Some(ridge);
+                self.selected = Some(0);
+                self.placed_for = Some(self.seed);
+                let jammed = self.jammed().iter().filter(|&&j| j).count();
+                self.place_msg = Some(format!(
+                    "Seed {}: {} of {} drones jammed ({:.0} %).",
+                    self.seed,
+                    jammed,
+                    self.swarm.len(),
+                    100.0 * jammed as f64 / self.swarm.len().max(1) as f64
+                ));
+            }
+            Err(_) => {
+                self.placed_for = None;
+                self.place_msg = Some(format!(
+                    "Seed {}: place_jamming found no placement with {} to {} % jammed. \
+                     Check the threshold and d0 sliders.",
+                    self.seed,
+                    100.0 * self.config.jam_frac_min,
+                    100.0 * self.config.jam_frac_max
+                ));
+            }
+        }
+    }
+
     fn load_two_jammers(&mut self) {
         self.jammers = vec![
             Jammer {
@@ -312,6 +375,7 @@ impl JamApp {
             d0: self.config.jam_d0,
             factor: self.config.ridge_factor,
             threshold: self.config.jam_threshold,
+            p0: self.config.jam_p0,
             combine: self.combine,
             scale: self.scale,
             contours: self.contours,
@@ -343,15 +407,19 @@ impl JamApp {
                 vals[r * w + c] = self.total_power(at);
             }
         }
-        let mut px: Vec<Color32> = vals.iter().map(|&v| heat_color(self.scale_t(v))).collect();
+        let p0 = self.config.jam_p0.max(1e-9);
+        let mut px: Vec<Color32> = vals
+            .iter()
+            .map(|&v| heat_color(self.scale_t(v / p0)))
+            .collect();
 
         if self.contours {
             // A pixel is on a contour when it and its right or lower neighbour sit on
             // different sides of the level.
             let levels = [
-                (self.config.jam_threshold, Color32::WHITE),
-                (0.2, Color32::from_white_alpha(110)),
-                (0.1, Color32::from_white_alpha(70)),
+                (self.threshold(), Color32::WHITE),
+                (0.2 * p0, Color32::from_white_alpha(110)),
+                (0.1 * p0, Color32::from_white_alpha(70)),
             ];
             for r in 0..h {
                 for c in 0..w {
@@ -394,7 +462,6 @@ impl JamApp {
 
         // Jammers.
         ui.label(RichText::new("Jammers").strong());
-        ui.add(egui::Slider::new(&mut self.new_power, 0.1..=3.0).text("P0 of new jammers"));
         let mut remove = None;
         for (i, j) in self.jammers.iter_mut().enumerate() {
             ui.horizontal(|ui| {
@@ -469,8 +536,15 @@ impl JamApp {
         }
         ui.separator();
 
-        // Physics.
+        // Physics. Moving any of these re-runs place_jamming when a placement is shown.
         ui.label(RichText::new("Physics (SimConfig)").strong());
+        let physics_before = (
+            self.config.jam_p0,
+            self.config.jam_d0,
+            self.config.ridge_factor,
+            self.config.jam_threshold,
+        );
+        ui.add(egui::Slider::new(&mut self.config.jam_p0, 0.1..=3.0).text("P0  jammer power"));
         ui.add(
             egui::Slider::new(&mut self.config.jam_d0, 0.5..=10.0)
                 .text("d0  half-power distance")
@@ -480,6 +554,24 @@ impl JamApp {
         ui.add(
             egui::Slider::new(&mut self.config.jam_threshold, 0.05..=1.0).text("jammed threshold"),
         );
+        ui.weak("Threshold, 0.2 and 0.1 contours and colours are fractions of P0.");
+        let physics_after = (
+            self.config.jam_p0,
+            self.config.jam_d0,
+            self.config.ridge_factor,
+            self.config.jam_threshold,
+        );
+        if physics_after != physics_before {
+            if self.placed_for.is_some() {
+                // Live: a new placement under the new physics.
+                self.place_from_seed();
+            } else if physics_after.0 != physics_before.0 {
+                // No placement shown: P0 applies to the jammers on the map.
+                for j in &mut self.jammers {
+                    j.power = self.config.jam_p0;
+                }
+            }
+        }
         ui.horizontal(|ui| {
             ui.label("Several jammers:");
             ui.selectable_value(&mut self.combine, Combine::Sum, "sum");
@@ -488,9 +580,12 @@ impl JamApp {
         ui.weak("How jammers add up is not decided yet (D02). Noise powers usually add: sum.");
         if ui.button("Reset physics to defaults").clicked() {
             let d = SimConfig::default();
+            self.config.jam_p0 = d.jam_p0;
             self.config.jam_d0 = d.jam_d0;
             self.config.ridge_factor = d.ridge_factor;
             self.config.jam_threshold = d.jam_threshold;
+            self.config.jam_frac_min = d.jam_frac_min;
+            self.config.jam_frac_max = d.jam_frac_max;
         }
         ui.separator();
 
@@ -543,17 +638,67 @@ impl JamApp {
         // Swarm.
         ui.label(RichText::new("Swarm").strong());
         ui.checkbox(&mut self.show_swarm, "Show a spawned swarm");
+        let seed_before = self.seed;
+        ui.horizontal(|ui| {
+            ui.label("Seed");
+            ui.add(egui::DragValue::new(&mut self.seed).range(0..=999_999));
+            if ui.small_button("◀").clicked() {
+                self.seed = self.seed.saturating_sub(1);
+            }
+            if ui.small_button("▶").clicked() {
+                self.seed += 1;
+            }
+        });
+        ui.horizontal(|ui| {
+            if ui
+                .button("Place from seed")
+                .on_hover_text(
+                    "Runs your place_jamming on this seed's swarm: one jammer and one \
+                     ridge, redrawn until 5-30 % of the drones are jammed.\n\
+                     Replaces the jammers and the ridge on the map.",
+                )
+                .clicked()
+            {
+                self.place_from_seed();
+            }
+            ui.checkbox(&mut self.auto_place, "on every seed change");
+        });
+
+        // Placement bounds (D02), live: moving a slider re-runs place_jamming.
+        let bounds_before = (self.config.jam_frac_min, self.config.jam_frac_max);
+        ui.add(
+            egui::Slider::new(&mut self.config.jam_frac_min, 0.0..=1.0)
+                .text("min jammed share")
+                .custom_formatter(|v, _| format!("{:.0} %", v * 100.0)),
+        );
+        ui.add(
+            egui::Slider::new(&mut self.config.jam_frac_max, 0.0..=1.0)
+                .text("max jammed share")
+                .custom_formatter(|v, _| format!("{:.0} %", v * 100.0)),
+        );
+        // Keep min <= max: whichever slider moved pushes the other one.
+        if self.config.jam_frac_min > self.config.jam_frac_max {
+            if self.config.jam_frac_min != bounds_before.0 {
+                self.config.jam_frac_max = self.config.jam_frac_min;
+            } else {
+                self.config.jam_frac_min = self.config.jam_frac_max;
+            }
+        }
+        let bounds_moved = (self.config.jam_frac_min, self.config.jam_frac_max) != bounds_before;
+        if bounds_moved && self.placed_for.is_some() {
+            self.place_from_seed();
+        }
+        ui.weak("place_jamming redraws until the jammed share is between these. Moving them re-places live.");
+        if self.auto_place && self.seed != seed_before {
+            self.place_from_seed();
+        }
+        if let Some(msg) = &self.place_msg {
+            ui.weak(msg);
+        }
+        if self.placed_for.is_some() && self.placed_for != Some(self.seed) {
+            ui.weak("The seed changed since the placement: press the button again.");
+        }
         ui.add_enabled_ui(self.show_swarm, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Seed");
-                ui.add(egui::DragValue::new(&mut self.seed).range(0..=999_999));
-                if ui.small_button("◀").clicked() {
-                    self.seed = self.seed.saturating_sub(1);
-                }
-                if ui.small_button("▶").clicked() {
-                    self.seed += 1;
-                }
-            });
             ui.checkbox(&mut self.show_failed, "Show failed links (red, dashed)");
         });
         ui.weak("Jammed = power ≥ threshold. A link fails when either end is jammed.");
@@ -588,7 +733,7 @@ impl JamApp {
     // --------------------------------------------------------- right panel
 
     fn details(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("Power against distance").strong());
+        ui.label(RichText::new("Power against distance (as a fraction of P0)").strong());
         ui.label(RichText::new("P(d) = P0 / (1 + (d / d0)²)").monospace());
         falloff_plot(ui, &self.config);
         let d0 = self.config.jam_d0;
@@ -601,7 +746,7 @@ impl JamApp {
                 ui.label("behind ridge");
                 ui.end_row();
                 for k in [0.0, 1.0, 2.0, 3.0] {
-                    let p = 1.0 / (1.0 + k * k);
+                    let p = self.config.jam_p0 / (1.0 + k * k);
                     ui.label(format!("{k} d0 = {:.1} km", k * d0));
                     ui.label(format!("{p:.3}"));
                     ui.label(format!("{:.3}", p * f));
@@ -625,7 +770,7 @@ impl JamApp {
             }
             Some(at) => {
                 let total = self.total_power(at);
-                let jammed = total >= self.config.jam_threshold;
+                let jammed = total >= self.threshold();
                 ui.label(format!("({:.2}, {:.2}) km", at.x, at.y));
                 ui.label(
                     RichText::new(format!(
@@ -811,7 +956,7 @@ impl JamApp {
                     let position = self.clamp_to_arena(t.to_km(p));
                     self.jammers.push(Jammer {
                         position,
-                        power: self.new_power,
+                        power: self.config.jam_p0,
                     });
                     self.selected = Some(self.jammers.len() - 1);
                 }
@@ -1059,7 +1204,7 @@ impl JamApp {
                     role_name(d.role)
                 ));
                 ui.label(format!("Jamming power {power:.3}"));
-                ui.label(if power >= self.config.jam_threshold {
+                ui.label(if power >= self.threshold() {
                     "Jammed: all its links fail"
                 } else {
                     "Not jammed"
@@ -1448,6 +1593,47 @@ mod tests {
                 .all(|e| !jammed[e.src as usize] && !jammed[e.dst as usize])
         );
         assert!(after.edges.len() < app.graph.edges.len());
+    }
+
+    #[test]
+    fn place_from_seed_matches_the_dataset_order() {
+        let mut app = JamApp {
+            seed: 4,
+            ..Default::default()
+        };
+        app.place_from_seed();
+        // Same calls, same RNG order as the dataset: spawn, then place.
+        let cfg = SimConfig::default();
+        let mut rng = ChaCha8Rng::seed_from_u64(4);
+        let swarm = spawn_swarm(&cfg, &mut rng);
+        let (jammer, ridge) = place_jamming(&swarm, &cfg, &mut rng);
+        assert_eq!(app.swarm, swarm);
+        assert_eq!(app.jammers, vec![jammer]);
+        assert_eq!(app.ridge, Some(ridge));
+        assert_eq!(app.placed_for, Some(4));
+        // The placement respects the bounds.
+        let f = app.jammed().iter().filter(|&&j| j).count() as f64 / app.swarm.len() as f64;
+        assert!((cfg.jam_frac_min..=cfg.jam_frac_max).contains(&f));
+    }
+
+    #[test]
+    fn p0_cancels_out_of_who_is_jammed() {
+        // The threshold is a fraction of P0 and the placed jammer has power P0,
+        // so doubling P0 doubles every power and the threshold: same placement.
+        let mut a = JamApp {
+            seed: 9,
+            ..Default::default()
+        };
+        a.place_from_seed();
+        let mut b = JamApp {
+            seed: 9,
+            ..Default::default()
+        };
+        b.config.jam_p0 = 2.0;
+        b.place_from_seed();
+        assert_eq!(a.jammed(), b.jammed());
+        assert_eq!(a.ridge, b.ridge);
+        assert_eq!(a.jammers[0].position, b.jammers[0].position);
     }
 
     #[test]

@@ -258,4 +258,120 @@ mod tests {
         assert!(orient(a, b, p(0.5, -1.0)) < 0.0, "right of a -> b");
         assert_eq!(orient(a, b, p(3.0, 0.0)), 0.0, "on the line");
     }
+
+    // ------------------------------------------------------------ place_jamming
+
+    use crate::spawn::spawn_swarm;
+    use rand::SeedableRng;
+
+    /// Spawns the swarm for `seed`, then places jamming with the same RNG
+    /// (the dataset order).
+    fn placed(seed: u64, cfg: &SimConfig) -> (Vec<Drone>, Jammer, Ridge) {
+        let mut rng = ChaCha8Rng::seed_from_u64(seed);
+        let swarm = spawn_swarm(cfg, &mut rng);
+        let (jammer, ridge) = place_jamming(&swarm, cfg, &mut rng);
+        (swarm, jammer, ridge)
+    }
+
+    fn jammed_share(swarm: &[Drone], j: &Jammer, r: &Ridge, cfg: &SimConfig) -> f64 {
+        let threshold = cfg.jam_threshold * cfg.jam_p0;
+        let n = swarm
+            .iter()
+            .filter(|d| jam_power(j, r, d.position, cfg) >= threshold)
+            .count();
+        n as f64 / swarm.len() as f64
+    }
+
+    #[test]
+    fn placement_jams_a_share_within_the_bounds() {
+        let cfg = SimConfig::default();
+        for seed in 0..20 {
+            let (swarm, j, r) = placed(seed, &cfg);
+            let share = jammed_share(&swarm, &j, &r, &cfg);
+            assert!(
+                (cfg.jam_frac_min..=cfg.jam_frac_max).contains(&share),
+                "seed {seed}: {share}"
+            );
+        }
+    }
+
+    #[test]
+    fn placement_is_deterministic() {
+        let cfg = SimConfig::default();
+        let (_, j1, r1) = placed(42, &cfg);
+        let (_, j2, r2) = placed(42, &cfg);
+        assert_eq!((j1, r1), (j2, r2));
+        let (_, j3, _) = placed(43, &cfg);
+        assert_ne!(j1, j3, "another seed, another jammer");
+    }
+
+    #[test]
+    fn jammer_is_in_the_arena_with_power_p0() {
+        let cfg = SimConfig {
+            jam_p0: 1.7,
+            ..SimConfig::default()
+        };
+        for seed in 0..10 {
+            let (_, j, _) = placed(seed, &cfg);
+            assert!((0.0..cfg.arena_w).contains(&j.position.x));
+            assert!((0.0..cfg.arena_h).contains(&j.position.y));
+            assert_eq!(j.power, 1.7);
+        }
+    }
+
+    #[test]
+    fn ridge_geometry_follows_the_constants() {
+        let cfg = SimConfig::default();
+        for seed in 0..20 {
+            let (_, j, r) = placed(seed, &cfg);
+            let len = r.a.dist(r.b);
+            assert!(
+                (RIDGE_LEN_MIN..RIDGE_LEN_MAX).contains(&len),
+                "length {len}"
+            );
+
+            let middle = p((r.a.x + r.b.x) / 2.0, (r.a.y + r.b.y) / 2.0);
+            let dist = j.position.dist(middle);
+            assert!(
+                (RIDGE_DIST_MIN - 1e-9..RIDGE_DIST_MAX + 1e-9).contains(&dist),
+                "distance {dist}"
+            );
+
+            // Roughly facing the jammer: the ridge is within RIDGE_TILT of perpendicular
+            // to the jammer -> middle direction, so |cos(angle)| <= sin(RIDGE_TILT).
+            let (ux, uy) = ((r.b.x - r.a.x) / len, (r.b.y - r.a.y) / len);
+            let (vx, vy) = (
+                (middle.x - j.position.x) / dist,
+                (middle.y - j.position.y) / dist,
+            );
+            let cos = (ux * vx + uy * vy).abs();
+            assert!(cos <= RIDGE_TILT.sin() + 1e-9, "cos {cos}");
+        }
+    }
+
+    #[test]
+    fn the_ridge_shadows_some_of_the_arena() {
+        // Facing the jammer, the ridge must block the line to a point just behind
+        // its middle.
+        let cfg = SimConfig::default();
+        let (_, j, r) = placed(5, &cfg);
+        let middle = p((r.a.x + r.b.x) / 2.0, (r.a.y + r.b.y) / 2.0);
+        let behind = p(
+            middle.x + 0.5 * (middle.x - j.position.x),
+            middle.y + 0.5 * (middle.y - j.position.y),
+        );
+        assert!(segments_cross(j.position, behind, r.a, r.b));
+    }
+
+    #[test]
+    #[should_panic(expected = "no jamming placement")]
+    fn impossible_bounds_panic_instead_of_looping_forever() {
+        // Every drone jammed at once is impossible: the squads span the whole arena.
+        let cfg = SimConfig {
+            jam_frac_min: 1.0,
+            jam_frac_max: 1.0,
+            ..SimConfig::default()
+        };
+        placed(0, &cfg);
+    }
 }

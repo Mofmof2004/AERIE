@@ -141,6 +141,12 @@ real `swarmsim::jamming::jam_power` at every pixel (0.2 km).
   blue when the ridge blocks them.
 - **Swarm layer:** a spawned swarm (seed); jammed drones get a red ring, failed links are red
   and dashed.
+- **Place from seed:** runs `place_jamming` on the chosen seed's swarm (spawn, then place, same
+  RNG, exactly like the dataset) and puts that jammer and ridge on the map. Tick *on every seed
+  change* to re-place automatically while you step through seeds with ◀ ▶.
+  The *min / max jammed share* sliders (`jam_frac_min`, `jam_frac_max`) and the physics
+  sliders (*P0*, *d0*, *ridge factor*, *jammed threshold*) re-run the placement live as you
+  drag them. The threshold is a fraction of P0, as in `place_jamming`.
 - **Right panel:** power against distance (open ground and behind the ridge), the value table,
   the power at the cursor per jammer (clear or blocked), and the effect on the swarm before
   and after jamming (links, mean degree, components, isolated drones).
