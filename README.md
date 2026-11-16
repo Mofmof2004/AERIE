@@ -1,0 +1,107 @@
+# AERIE
+
+A graph-learning brain for a simulated 100-drone reconnaissance swarm, written in Rust.
+Drones are nodes, radio links are edges, sensor readings are graph signals.
+The full plan is in [Project_Plan.md](Project_Plan.md).
+
+## Layout
+
+```
+AERIE/
+├── Cargo.toml              workspace: members, shared dependency versions
+├── crates/
+│   ├── aerie-graph/        graph storage: Edge, EdgeList, degrees, neighbours, components
+│   ├── swarmsim/           the simulator (Mission 0)
+│   │   └── src/
+│   │       ├── config.rs   SimConfig: squads, arena, cells, radio ranges
+│   │       ├── drone.rs    DroneId, SquadId, Role, Vec2, Drone
+│   │       ├── spawn.rs    spawn_swarm: places the squads and drones
+│   │       └── graphs/     one folder per graph recipe
+│   │           ├── epsilon/   builder.rs, tests.rs
+│   │           └── knn/       builder.rs, tests.rs
+│   └── aerie-viz/          GUIs (egui): one binary per GUI in src/bin/
+└── target/                 build output (not committed)
+```
+
+## Everyday commands
+
+Run them from the repo root.
+
+| What | Command |
+|---|---|
+| Build everything | `cargo build` |
+| Build one crate | `cargo build -p swarmsim` |
+| Run all tests | `cargo test` |
+| Test one crate | `cargo test -p swarmsim` |
+| Run tests whose name contains a word | `cargo test -p swarmsim spawn` |
+| Show `println!` output in tests | `cargo test -p swarmsim -- --nocapture` |
+| Format the code | `cargo fmt` |
+| Lint (style and common mistakes) | `cargo clippy --all-targets` |
+| Lint one crate | `cargo clippy -p swarmsim --all-targets` |
+| Check it compiles, without building binaries | `cargo check` |
+| Open the docs of the whole workspace | `cargo doc --open` |
+
+Before committing: `cargo fmt`, then `cargo clippy --all-targets`, then `cargo test`.
+
+Crate names: `aerie-graph`, `swarmsim`, `aerie-viz`.
+
+## GUIs
+
+Always use `--release` for the GUIs: they are much smoother.
+
+| GUI | Command |
+|---|---|
+| Swarm viewer (default) | `cargo run --release -p aerie-viz` |
+| Swarm viewer, by name | `cargo run --release -p aerie-viz --bin swarm_viewer` |
+| Epsilon playground | `cargo run --release -p aerie-viz --bin epsilon_playground` |
+
+### Swarm viewer
+
+Shows a whole spawned swarm: squads, roles, grid cells.
+
+- **Left panel:** mission, seed (◀ ▶ to step), cell size, squad count and size, spread, radio ranges, layers, legend.
+- **Map:** scroll to zoom, drag to pan, click a drone to select it, hover for details.
+- **Right panel:** swarm summary, the selected drone, the squads table.
+- Seeds 0-79 train, 80-89 validate, 90-99 test.
+
+### Epsilon playground
+
+Place drones by hand and watch the epsilon graph form. It calls the real builders
+`textbook_epsilon_graph` and `epsilon_graph` from `swarmsim::graphs::epsilon`.
+
+- **Modes:**
+  - *Textbook*: one ε and one σ for every pair, roles ignored.
+  - *Swarm (D00)*: ε = the smaller of the two radio ranges, σ = ε / 2.
+- **Canvas:**
+
+  | Action | Effect |
+  |---|---|
+  | Click empty space | add a drone (role chosen in the left panel) |
+  | Drag a drone | move it (snaps to 0.5 km if enabled) |
+  | Click a drone | select it: its edges stay bright, σ ring shown |
+  | Right-click a drone | delete it |
+  | Delete key | delete the selected drone |
+  | Esc | deselect |
+
+- **Presets:** *Test cases* (recon pair at 4 km, recon-relay at 6 km, relay pair at 8 km;
+  swarm mode expects weights 0.278, no link, 0.206), *Random* (count and seed), *Clear*.
+- **Right panel:** the Gaussian kernel w(d) = exp(−d² / 2σ²), cut at ε. Each edge is a dot on
+  the curve, and you can hover the plot to read values. Below it: graph stats and the edge list.
+
+## Adding things
+
+- **A new crate:** `cargo new crates/<name> --lib --vcs none`. The `--vcs none` flag stops it
+  from creating a nested git repo. Then use `edition.workspace = true` and
+  `dep = { workspace = true }` in its `Cargo.toml`.
+- **A new dependency:** add the version once under `[workspace.dependencies]` in the root
+  `Cargo.toml`, then `name = { workspace = true }` in the crate that uses it.
+- **A new GUI:** add a file in `crates/aerie-viz/src/bin/`. It becomes a binary named after the
+  file, run with `cargo run --release -p aerie-viz --bin <file_name>`.
+- **A new graph recipe:** add a folder in `crates/swarmsim/src/graphs/` with `mod.rs`,
+  `builder.rs` and `tests.rs`, and declare it with `pub mod <name>;` in `graphs.rs`.
+
+## Reproducibility
+
+All randomness goes through a seeded `ChaCha8Rng` passed as `&mut`.
+Never use `rand::rng()` (thread-local) in simulation code.
+The same seed and config always give the same swarm.
