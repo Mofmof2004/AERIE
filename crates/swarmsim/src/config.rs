@@ -32,8 +32,20 @@ pub struct SimConfig {
     /// uniformly, km. A member is at most `squad_spread` from the centre on each axis.
     /// Main knob for mean degree and cross-squad links. Tuned in step 1.
     pub squad_spread: f64,
-    /// k for the kNN graph. With the union rule each drone gets between k and 2k links.
+    /// k for the kNN graph. With the union rule every drone gets at least k links and
+    /// the mean degree is between k and 2k; a hub can get more.
     pub knn_k: usize,
+    /// Jamming falloff distance, km: power = P0 / (1 + (d / d0)^2), so half power at d0.
+    pub jam_d0: f64,
+    /// P0: power of a new jammer at its own position. Thresholds and noise are fractions of it.
+    pub jam_p0: f64,
+    /// Multiplier on jamming power behind the ridge (the ridge shadow).
+    pub ridge_factor: f64,
+    /// Jamming power (as a fraction of P0) at or above which a drone is in the jammed
+    /// zone and all its links fail.
+    pub jam_threshold: f64,
+    /// Standard deviation of the Gaussian sensor noise on jam readings, as a fraction of P0.
+    pub noise_sd: f64,
 }
 
 impl Default for SimConfig {
@@ -49,6 +61,11 @@ impl Default for SimConfig {
             range_long: 16.0,
             squad_spread: 2.0,
             knn_k: 5,
+            jam_d0: 4.0,
+            jam_p0: 1.0,
+            ridge_factor: 0.1,
+            jam_threshold: 0.5,
+            noise_sd: 0.1,
         }
     }
 }
