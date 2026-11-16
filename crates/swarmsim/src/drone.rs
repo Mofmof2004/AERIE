@@ -16,6 +16,10 @@ pub enum Role {
 }
 
 impl Role {
+    /// Every role once. Update when adding a role.
+    pub const ALL: [Role; 4] = [Role::Recon, Role::RfSensing, Role::Relay, Role::Compute];
+
+    /// Role as a one-hot vector, in the order of `Role::ALL`.
     pub fn one_hot(self) -> [f64; 4] {
         match self {
             Role::Recon => [1.0, 0.0, 0.0, 0.0],
@@ -23,6 +27,11 @@ impl Role {
             Role::Relay => [0.0, 0.0, 1.0, 0.0],
             Role::Compute => [0.0, 0.0, 0.0, 1.0],
         }
+    }
+
+    /// Number of roles (4).
+    pub fn num_roles() -> usize {
+        Role::ALL.len()
     }
 
     /// How far this drone's radio reaches, in km. Relays get the long range,
@@ -85,12 +94,19 @@ impl Vec2 {
 mod tests {
     use super::*;
 
-    /// Every role once. If a fifth role is added, add it here too.
-    const ALL_ROLES: [Role; 4] = [Role::Recon, Role::RfSensing, Role::Relay, Role::Compute];
+    #[test]
+    fn all_lists_every_role_once() {
+        assert_eq!(Role::num_roles(), 4);
+        for (i, a) in Role::ALL.iter().enumerate() {
+            for b in &Role::ALL[i + 1..] {
+                assert_ne!(a, b, "{a:?} listed twice in Role::ALL");
+            }
+        }
+    }
 
     #[test]
     fn one_hot_has_a_single_one() {
-        for role in ALL_ROLES {
+        for role in Role::ALL {
             let v = role.one_hot();
             assert_eq!(v.iter().sum::<f64>(), 1.0, "{role:?} does not sum to 1");
             assert_eq!(
@@ -104,8 +120,8 @@ mod tests {
     #[test]
     fn one_hots_are_all_different() {
         // Two roles sharing a one-hot would be indistinguishable to every model.
-        for a in ALL_ROLES {
-            for b in ALL_ROLES {
+        for a in Role::ALL {
+            for b in Role::ALL {
                 if a != b {
                     assert_ne!(a.one_hot(), b.one_hot(), "{a:?} and {b:?} collide");
                 }
