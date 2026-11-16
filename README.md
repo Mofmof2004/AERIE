@@ -3,23 +3,29 @@
 A graph-learning brain for a simulated 100-drone reconnaissance swarm, written in Rust.
 Drones are nodes, radio links are edges, sensor readings are graph signals.
 The full plan is in [Project_Plan.md](Project_Plan.md).
+Design decisions and the evidence behind them are in [DECISIONS.md](DECISIONS.md).
 
 ## Layout
 
 ```
 AERIE/
 ├── Cargo.toml              workspace: members, shared dependency versions
+├── DECISIONS.md            decision log: D00 ground rules, D01 epsilon-graph tuning, ...
 ├── crates/
 │   ├── aerie-graph/        graph storage: Edge, EdgeList, degrees, neighbours, components
 │   ├── swarmsim/           the simulator (Mission 0)
+│   │   ├── examples/       small programs using the crate, e.g. epsilon_stats.rs
 │   │   └── src/
-│   │       ├── config.rs   SimConfig: squads, arena, cells, radio ranges
+│   │       ├── config.rs   SimConfig: squads, arena, cells, radio ranges, k
 │   │       ├── drone.rs    DroneId, SquadId, Role, Vec2, Drone
 │   │       ├── spawn.rs    spawn_swarm: places the squads and drones
-│   │       └── graphs/     one folder per graph recipe
-│   │           ├── epsilon/   builder.rs, tests.rs
-│   │           └── knn/       builder.rs, tests.rs
+│   │       ├── graphs.rs   declares the graph modules below
+│   │       └── graphs/
+│   │           ├── epsilon/   epsilon_graph (D00 rule), textbook_epsilon_graph, tests
+│   │           ├── knn/       knn_graph (union rule), tests
+│   │           └── stats.rs   stats(): mean degree, components, cross-squad share
 │   └── aerie-viz/          GUIs (egui): one binary per GUI in src/bin/
+│       └── src/bin/        swarm_viewer.rs, graph_playground.rs
 └── target/                 build output (not committed)
 ```
 
@@ -45,6 +51,14 @@ Before committing: `cargo fmt`, then `cargo clippy --all-targets`, then `cargo t
 
 Crate names: `aerie-graph`, `swarmsim`, `aerie-viz`.
 
+## Examples
+
+Small programs in `crates/swarmsim/examples/`. Run with `--release`.
+
+| Example | Command | What it prints |
+|---|---|---|
+| ε-graph stats | `cargo run --release -p swarmsim --example epsilon_stats` | one row per seed: links, mean degree, components, largest, isolated, share between squads; then the mean and the targets (D01) |
+
 ## GUIs
 
 Always use `--release` for the GUIs: they are much smoother.
@@ -57,11 +71,14 @@ Always use `--release` for the GUIs: they are much smoother.
 
 ### Swarm viewer
 
-Shows a whole spawned swarm: squads, roles, grid cells.
+Shows a whole spawned swarm: squads, roles, grid cells and the comm graph (ε-graph).
 
 - **Left panel:** mission, seed (◀ ▶ to step), cell size, squad count and size, spread, radio ranges, layers, legend.
+- **Links layer:** width = weight; colour by weight, or by inside / between squads
+  (links between squads stand out). Select a drone to highlight its links.
 - **Map:** scroll to zoom, drag to pan, click a drone to select it, hover for details.
-- **Right panel:** swarm summary, the selected drone, the squads table.
+- **Right panel:** swarm summary, link stats from `stats()` with the targets, the selected
+  drone (links, cross-squad links, weighted degree), the squads table.
 - Seeds 0-79 train, 80-89 validate, 90-99 test.
 
 ### Graph playground
@@ -91,8 +108,19 @@ Place drones by hand and watch the comm graph form. It calls the real builders
 - **Presets:** *Test cases* (recon pair at 4 km, recon-relay at 6 km, relay pair at 8 km;
   swarm mode expects weights 0.278, no link, 0.206), *kNN line* (x = 0, 1, 3, 7, k = 1:
   a path), *kNN hub* (k = 1: the centre gets 4 links > 2k), *Random* (count and seed), *Clear*.
-- **Right panel:** the Gaussian kernel w(d) = exp(−d² / 2σ²), cut at ε. Each edge is a dot on
-  the curve, and you can hover the plot to read values. Below it: graph stats and the edge list.
+- **Right panel:** the Gaussian kernel w(d) = exp(−d² / 2σ²), cut at ε (no cut in kNN mode).
+  Each edge is a dot on the curve, and you can hover the plot to read values. Below it: graph
+  stats from `stats()` with ✔ / ✘ against the targets, and the edge list.
+- **Squads:** each drone has a squad (picker in the left panel), shown as `S1` next to its
+  number. Only used by the share-between-squads stat.
+- **Dashed lines:**
+
+  | Where | Meaning |
+  |---|---|
+  | Grey dashes between drones (Swarm mode) | one-way pair: in the longer range but not the shorter one, so no link |
+  | Dashed edge (kNN mode) | kNN link longer than the radio range |
+  | Dashed ring around the selected drone | σ ring, where the weight is 0.607 |
+  | Dashed curve on the kernel plot | weight beyond ε, where no edge exists |
 
 ## Adding things
 
@@ -103,6 +131,10 @@ Place drones by hand and watch the comm graph form. It calls the real builders
   `Cargo.toml`, then `name = { workspace = true }` in the crate that uses it.
 - **A new GUI:** add a file in `crates/aerie-viz/src/bin/`. It becomes a binary named after the
   file, run with `cargo run --release -p aerie-viz --bin <file_name>`.
+- **A new example:** add a file in `crates/swarmsim/examples/` with a `fn main()`. Import
+  with `use swarmsim::...` (not `crate::`), run with `--example <file_name>`.
+- **A new decision:** add an entry `Dxx` to `DECISIONS.md` (Chose / Rejected / Evidence /
+  Cost / Revisit).
 - **A new graph recipe:** add a folder in `crates/swarmsim/src/graphs/` with `mod.rs`,
   `builder.rs` and `tests.rs`, and declare it with `pub mod <name>;` in `graphs.rs`.
 
