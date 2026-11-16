@@ -16,16 +16,17 @@ AERIE/
 │   ├── swarmsim/           the simulator (Mission 0)
 │   │   ├── examples/       small programs using the crate, e.g. epsilon_stats.rs
 │   │   └── src/
-│   │       ├── config.rs   SimConfig: squads, arena, cells, radio ranges, k
+│   │       ├── config.rs   SimConfig: squads, arena, cells, radio ranges, k, jamming (P0, d0, ridge factor, threshold, noise)
 │   │       ├── drone.rs    DroneId, SquadId, Role, Vec2, Drone
 │   │       ├── spawn.rs    spawn_swarm: places the squads and drones
+│   │       ├── jamming.rs  Jammer, Ridge, jam_power (falloff and ridge shadow)
 │   │       ├── graphs.rs   declares the graph modules below
 │   │       └── graphs/
 │   │           ├── epsilon/   epsilon_graph (D00 rule), textbook_epsilon_graph, tests
 │   │           ├── knn/       knn_graph (union rule), tests
 │   │           └── stats.rs   stats(): mean degree, components, cross-squad share
 │   └── aerie-viz/          GUIs (egui): one binary per GUI in src/bin/
-│       └── src/bin/        swarm_viewer.rs, graph_playground.rs
+│       └── src/bin/        swarm_viewer.rs, graph_playground.rs, jamming_playground.rs
 └── target/                 build output (not committed)
 ```
 
@@ -68,6 +69,7 @@ Always use `--release` for the GUIs: they are much smoother.
 | Swarm viewer (default) | `cargo run --release -p aerie-viz` |
 | Swarm viewer, by name | `cargo run --release -p aerie-viz --bin swarm_viewer` |
 | Graph playground | `cargo run --release -p aerie-viz --bin graph_playground` |
+| Jamming playground | `cargo run --release -p aerie-viz --bin jamming_playground` |
 
 ### Swarm viewer
 
@@ -121,6 +123,27 @@ Place drones by hand and watch the comm graph form. It calls the real builders
   | Dashed edge (kNN mode) | kNN link longer than the radio range |
   | Dashed ring around the selected drone | σ ring, where the weight is 0.607 |
   | Dashed curve on the kernel plot | weight beyond ε, where no edge exists |
+
+### Jamming playground
+
+Place jammers and a ridge, and see the jamming power everywhere. The heatmap calls the
+real `swarmsim::jamming::jam_power` at every pixel (0.2 km).
+
+- **Tools:** *Move* (drag jammers, a ridge end or the whole ridge; drag empty space to pan),
+  *Add jammer* (click), *Draw ridge* (drag from one end to the other; one ridge).
+  Right-click a jammer or the ridge to delete it, Delete key removes the selected jammer,
+  scroll zooms.
+- **Left panel:** each jammer's P0 and position, ridge ends, physics sliders (d0, ridge
+  factor, jammed threshold), how several jammers combine (sum or max, not decided yet),
+  presets (*Test setup* = the unit-test geometry moved by (10, 10)), display options.
+- **Map:** heatmap (linear or log scale), contours (white = jammed threshold, grey = 0.2 and
+  0.1), dashed d0 ring around each jammer. Lines from each jammer to the cursor are dashed
+  blue when the ridge blocks them.
+- **Swarm layer:** a spawned swarm (seed); jammed drones get a red ring, failed links are red
+  and dashed.
+- **Right panel:** power against distance (open ground and behind the ridge), the value table,
+  the power at the cursor per jammer (clear or blocked), and the effect on the swarm before
+  and after jamming (links, mean degree, components, isolated drones).
 
 ## Adding things
 
