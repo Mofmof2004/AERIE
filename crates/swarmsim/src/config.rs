@@ -45,9 +45,9 @@ impl Default for SimConfig {
             arena_h: 20.0,
             cell_width: 5.0,
             cell_height: 5.0,
-            range_short: 5.0,
-            range_long: 9.0,
-            squad_spread: 1.0,
+            range_short: 2.5,
+            range_long: 16.0,
+            squad_spread: 2.0,
             knn_k: 5,
         }
     }

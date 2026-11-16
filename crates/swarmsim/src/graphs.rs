@@ -9,3 +9,4 @@
 
 pub mod epsilon;
 pub mod knn;
+pub mod stats;
