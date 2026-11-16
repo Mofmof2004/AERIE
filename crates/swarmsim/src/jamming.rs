@@ -1,8 +1,11 @@
 //! Jamming: the jammer, the ridge, and the jamming power at any point.
 
 use crate::config::SimConfig;
-use crate::drone::Vec2;
+use crate::drone::{Drone, Vec2};
+use rand::RngExt;
+use rand_chacha::ChaCha8Rng;
 use serde::{Deserialize, Serialize};
+use std::f64::consts::PI;
 
 /// An enemy emitter. Its power falls off with distance (see `jam_power`).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -42,6 +45,78 @@ pub fn jam_power(jammer: &Jammer, ridge: &Ridge, at: Vec2, config: &SimConfig) -
     }
 
     power
+}
+
+/// Distance from the jammer to the middle of the ridge, km.
+const RIDGE_DIST_MIN: f64 = 2.0;
+const RIDGE_DIST_MAX: f64 = 3.0;
+/// Ridge length, km.
+const RIDGE_LEN_MIN: f64 = 10.0;
+const RIDGE_LEN_MAX: f64 = 14.0;
+/// Largest random tilt of the ridge away from facing the jammer, radians.
+const RIDGE_TILT: f64 = 0.5;
+/// Safety limit on redraws, so a bad config cannot loop forever.
+const MAX_ATTEMPTS: usize = 10_000;
+
+/// One jammer and one ridge for this swarm (decision D02, rejection sampling).
+///
+/// The jammer is drawn uniformly in the arena; the ridge's middle is 2 to 3 km from it,
+/// roughly facing it, 10 to 14 km long. The pair is kept only if the fraction of
+/// jammed drones (ridge included) is between `jam_frac_min` and `jam_frac_max`;
+/// otherwise both are drawn again.
+///
+/// Panics if no placement works after `MAX_ATTEMPTS` tries.
+pub fn place_jamming(swarm: &[Drone], config: &SimConfig, rng: &mut ChaCha8Rng) -> (Jammer, Ridge) {
+    for _attempt in 0..MAX_ATTEMPTS {
+        // 1. Jammer anywhere in the arena.
+        let jammer = Jammer {
+            position: Vec2 {
+                x: rng.random_range(0.0..config.arena_w),
+                y: rng.random_range(0.0..config.arena_h),
+            },
+            power: config.jam_p0,
+        };
+
+        // 2. Ridge middle: a random direction and distance from the jammer.
+        let phi: f64 = rng.random_range(0.0..2.0 * PI);
+        let r: f64 = rng.random_range(RIDGE_DIST_MIN..RIDGE_DIST_MAX);
+        let middle = Vec2 {
+            x: jammer.position.x + r * phi.cos(),
+            y: jammer.position.y + r * phi.sin(),
+        };
+
+        // 3. Ridge direction: perpendicular to phi (facing the jammer), slightly tilted.
+        let theta = phi + PI / 2.0 + rng.random_range(-RIDGE_TILT..RIDGE_TILT);
+
+        // 4. Ridge ends, half the length on each side of the middle.
+        let half = rng.random_range(RIDGE_LEN_MIN..RIDGE_LEN_MAX) / 2.0;
+        let ridge = Ridge {
+            a: Vec2 {
+                x: middle.x - half * theta.cos(),
+                y: middle.y - half * theta.sin(),
+            },
+            b: Vec2 {
+                x: middle.x + half * theta.cos(),
+                y: middle.y + half * theta.sin(),
+            },
+        };
+
+        // 5. Fraction of drones jammed, ridge included.
+        let threshold = config.jam_threshold * config.jam_p0;
+        let mut jammed = 0;
+        for drone in swarm {
+            if jam_power(&jammer, &ridge, drone.position, config) >= threshold {
+                jammed += 1;
+            }
+        }
+        let fraction = jammed as f64 / swarm.len() as f64;
+
+        // 6. Keep it if the jammed zone has a useful size.
+        if fraction >= config.jam_frac_min && fraction <= config.jam_frac_max {
+            return (jammer, ridge);
+        }
+    }
+    panic!("no jamming placement after {MAX_ATTEMPTS} attempts");
 }
 
 #[cfg(test)]

@@ -19,7 +19,7 @@ AERIE/
 │   │       ├── config.rs   SimConfig: squads, arena, cells, radio ranges, k, jamming (P0, d0, ridge factor, threshold, noise)
 │   │       ├── drone.rs    DroneId, SquadId, Role, Vec2, Drone
 │   │       ├── spawn.rs    spawn_swarm: places the squads and drones
-│   │       ├── jamming.rs  Jammer, Ridge, jam_power (falloff and ridge shadow)
+│   │       ├── jamming.rs  Jammer, Ridge, jam_power (falloff, ridge shadow), place_jamming (D02)
 │   │       ├── graphs.rs   declares the graph modules below
 │   │       └── graphs/
 │   │           ├── epsilon/   epsilon_graph (D00 rule), textbook_epsilon_graph, tests

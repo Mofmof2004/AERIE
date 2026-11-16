@@ -46,6 +46,10 @@ pub struct SimConfig {
     pub jam_threshold: f64,
     /// Standard deviation of the Gaussian sensor noise on jam readings, as a fraction of P0.
     pub noise_sd: f64,
+    /// A jamming placement is kept only if at least this fraction of drones is jammed.
+    pub jam_frac_min: f64,
+    /// ...and at most this fraction (decision D02).
+    pub jam_frac_max: f64,
 }
 
 impl Default for SimConfig {
@@ -65,6 +69,8 @@ impl Default for SimConfig {
             jam_p0: 1.0,
             ridge_factor: 0.1,
             jam_threshold: 0.5,
+            jam_frac_min: 0.05,
+            jam_frac_max: 0.30,
             noise_sd: 0.1,
         }
     }
