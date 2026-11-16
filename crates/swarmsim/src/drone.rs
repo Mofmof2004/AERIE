@@ -176,9 +176,9 @@ mod tests {
     #[test]
     fn radio_range_by_role() {
         let cfg = SimConfig::default();
-        assert_eq!(Role::Relay.radio_range(&cfg), 9.0);
+        assert_eq!(Role::Relay.radio_range(&cfg), cfg.range_long);
         for role in [Role::Recon, Role::RfSensing, Role::Compute] {
-            assert_eq!(role.radio_range(&cfg), 5.0, "{role:?}");
+            assert_eq!(role.radio_range(&cfg), cfg.range_short, "{role:?}");
         }
         // The range follows the config, so experiments can change it.
         let long_relays = SimConfig {

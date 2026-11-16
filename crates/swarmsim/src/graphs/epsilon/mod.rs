@@ -6,8 +6,8 @@
 
 pub mod builder;
 
-// Once `epsilon_graph` exists in builder.rs, export it from here:
-// pub use builder::epsilon_graph;
+// Re-exported so callers write `graphs::epsilon::epsilon_graph`.
+pub use builder::{epsilon_graph, textbook_epsilon_graph};
 
 #[cfg(test)]
 mod tests;
