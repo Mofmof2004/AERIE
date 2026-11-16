@@ -5,14 +5,17 @@
 //! Left panel: mission, scenario and layers. Centre: the arena map
 //! (scroll to zoom, drag to pan, click a drone). Right panel: details.
 
+use aerie_graph::EdgeList;
 use eframe::egui::{self, RichText};
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use swarmsim::config::SimConfig;
 use swarmsim::drone::{Drone, Role};
+use swarmsim::graphs::epsilon::epsilon_graph;
+use swarmsim::graphs::stats::stats;
 use swarmsim::spawn::spawn_swarm;
 
-use aerie_viz::map::{self, ColorBy, Layers, MapView, RangeCircles};
+use aerie_viz::map::{self, ColorBy, Layers, LinkColor, MapView, RangeCircles};
 use aerie_viz::mission::Mission;
 use aerie_viz::squads::{SquadInfo, cell_count, cell_options, squad_infos};
 use aerie_viz::style::{ramp, role_color, role_name, role_shape_name, squad_color, swatch};
@@ -36,6 +39,8 @@ struct Viewer {
     seed: u64,
     config: SimConfig,
     swarm: Vec<Drone>,
+    /// The comm graph of `swarm` (epsilon graph, decision D00).
+    graph: EdgeList,
     squads: Vec<SquadInfo>,
     /// The (seed, config) the current swarm was generated from.
     generated_for: Option<(u64, SimConfig)>,
@@ -52,6 +57,10 @@ impl Default for Viewer {
             seed: 0,
             config: SimConfig::default(),
             swarm: Vec::new(),
+            graph: EdgeList {
+                n: 0,
+                edges: Vec::new(),
+            },
             squads: Vec::new(),
             generated_for: None,
             layers: Layers::default(),
@@ -103,6 +112,7 @@ impl Viewer {
         }
         let mut rng = ChaCha8Rng::seed_from_u64(self.seed);
         self.swarm = spawn_swarm(&self.config, &mut rng);
+        self.graph = epsilon_graph(&self.swarm, &self.config);
         self.squads = squad_infos(&self.swarm);
         self.generated_for = Some(key);
         if self.selected.is_some_and(|i| i >= self.swarm.len()) {
@@ -216,9 +226,17 @@ impl Viewer {
             &mut self.layers.dim_other_squads,
             "Dim other squads on select",
         );
-        let mut no_links = false;
-        ui.add_enabled(false, egui::Checkbox::new(&mut no_links, "Links (ε-graph)"))
-            .on_disabled_hover_text("Appears once epsilon_graph exists in swarmsim.");
+        ui.checkbox(&mut self.layers.links, "Links (ε-graph)")
+            .on_hover_text("Width = weight. Select a drone to highlight its links.");
+        ui.add_enabled_ui(self.layers.links, |ui| {
+            egui::ComboBox::from_label("Link colour")
+                .selected_text(self.layers.link_color.label())
+                .show_ui(ui, |ui| {
+                    for c in LinkColor::ALL {
+                        ui.selectable_value(&mut self.layers.link_color, c, c.label());
+                    }
+                });
+        });
         ui.horizontal(|ui| {
             if ui.button("Reset view").clicked() {
                 self.view = MapView::default();
@@ -289,9 +307,43 @@ impl Viewer {
             &self.layers,
             &self.config,
             &self.swarm,
+            &self.graph,
             &self.squads,
             &mut self.selected,
         );
+    }
+
+    /// Summary of the comm graph, from `swarmsim::graphs::stats::stats`.
+    fn link_stats(&self, ui: &mut egui::Ui) {
+        let st = stats(&self.graph, &self.swarm);
+        egui::Grid::new("link_stats").striped(true).show(ui, |ui| {
+            let mut row = |k: &str, v: String| {
+                ui.label(k);
+                ui.label(v);
+                ui.end_row();
+            };
+            row("Links", st.n_edges.to_string());
+            row(
+                "Mean degree",
+                format!("{:.2}  (target 8-10)", st.mean_degree),
+            );
+            row("Mean weight", format!("{:.3}", st.mean_weight));
+            row(
+                "Components",
+                format!(
+                    "{}  (largest {} of {})",
+                    st.n_components, st.largest_component, st.n_nodes
+                ),
+            );
+            row("Isolated drones", st.isolated.to_string());
+            row(
+                "Between squads",
+                format!("{:.0} %  (target ~25 %)", 100.0 * st.cross_squad_share),
+            );
+        });
+        if st.n_components > 1 {
+            ui.weak("More than one component: some squads cannot reach each other.");
+        }
     }
 
     /// Right panel: swarm summary, selected drone, squads table.
@@ -320,8 +372,11 @@ impl Viewer {
                 ui.end_row();
             }
         });
-        let links = "Links: not built yet (epsilon_graph).";
-        ui.weak(links);
+        ui.separator();
+
+        // Comm graph.
+        ui.label(RichText::new("Links (ε-graph)").strong());
+        self.link_stats(ui);
         ui.separator();
 
         // Selected drone.
@@ -350,6 +405,24 @@ impl Viewer {
                         format!("({:.2}, {:.2}) km/step", d.velocity.x, d.velocity.y),
                     );
                     row("Radio range", format!("{:.1} km", d.role.radio_range(cfg)));
+                    let i = d.id.0 as usize;
+                    let mine: Vec<_> = self
+                        .graph
+                        .edges
+                        .iter()
+                        .filter(|e| e.src as usize == i || e.dst as usize == i)
+                        .collect();
+                    let cross = mine
+                        .iter()
+                        .filter(|e| {
+                            self.swarm[e.src as usize].squad != self.swarm[e.dst as usize].squad
+                        })
+                        .count();
+                    row("Links", format!("{} ({cross} to other squads)", mine.len()));
+                    row(
+                        "Weighted degree",
+                        format!("{:.2}", mine.iter().map(|e| e.weight).sum::<f64>()),
+                    );
                     row("Battery", format!("{:.2}", d.battery));
                     row("Sensor quality", format!("{:.2}", d.sensor_quality));
                     row("Compute capacity", format!("{:.2}", d.compute_capacity));
@@ -414,6 +487,9 @@ mod tests {
         v.seed = 1;
         v.regenerate();
         assert_ne!(v.swarm, first);
+        // The comm graph follows the swarm.
+        assert_eq!(v.graph.n as usize, v.swarm.len());
+        assert!(!v.graph.edges.is_empty());
         // An impossible squad count is clamped instead of hanging spawn_swarm.
         v.config.n_squads = 1000;
         v.regenerate();

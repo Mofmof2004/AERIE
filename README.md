@@ -53,7 +53,7 @@ Always use `--release` for the GUIs: they are much smoother.
 |---|---|
 | Swarm viewer (default) | `cargo run --release -p aerie-viz` |
 | Swarm viewer, by name | `cargo run --release -p aerie-viz --bin swarm_viewer` |
-| Epsilon playground | `cargo run --release -p aerie-viz --bin epsilon_playground` |
+| Graph playground | `cargo run --release -p aerie-viz --bin graph_playground` |
 
 ### Swarm viewer
 
@@ -64,14 +64,17 @@ Shows a whole spawned swarm: squads, roles, grid cells.
 - **Right panel:** swarm summary, the selected drone, the squads table.
 - Seeds 0-79 train, 80-89 validate, 90-99 test.
 
-### Epsilon playground
+### Graph playground
 
-Place drones by hand and watch the epsilon graph form. It calls the real builders
-`textbook_epsilon_graph` and `epsilon_graph` from `swarmsim::graphs::epsilon`.
+Place drones by hand and watch the comm graph form. It calls the real builders
+`textbook_epsilon_graph`, `epsilon_graph` and `knn_graph` from `swarmsim::graphs`.
 
 - **Modes:**
   - *Textbook*: one ε and one σ for every pair, roles ignored.
   - *Swarm (D00)*: ε = the smaller of the two radio ranges, σ = ε / 2.
+  - *kNN (union)*: each drone picks its k nearest (slider), linked if either picked.
+    Arrows show each drone's own picks (two arrows = mutual pick). Links longer than
+    the radio range are dashed: kNN has no cut-off, they just weigh less than 0.135.
 - **Canvas:**
 
   | Action | Effect |
@@ -82,9 +85,12 @@ Place drones by hand and watch the epsilon graph form. It calls the real builder
   | Right-click a drone | delete it |
   | Delete key | delete the selected drone |
   | Esc | deselect |
+  | Scroll | zoom around the cursor |
+  | Drag empty space | pan (*Reset view* in the left panel) |
 
 - **Presets:** *Test cases* (recon pair at 4 km, recon-relay at 6 km, relay pair at 8 km;
-  swarm mode expects weights 0.278, no link, 0.206), *Random* (count and seed), *Clear*.
+  swarm mode expects weights 0.278, no link, 0.206), *kNN line* (x = 0, 1, 3, 7, k = 1:
+  a path), *kNN hub* (k = 1: the centre gets 4 links > 2k), *Random* (count and seed), *Clear*.
 - **Right panel:** the Gaussian kernel w(d) = exp(−d² / 2σ²), cut at ε. Each edge is a dot on
   the curve, and you can hover the plot to read values. Below it: graph stats and the edge list.
 

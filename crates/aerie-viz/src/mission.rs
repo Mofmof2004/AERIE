@@ -57,8 +57,8 @@ impl Mission {
     pub fn description(self) -> &'static str {
         match self {
             Mission::M0 => {
-                "The swarm on station: squads, roles and grid cells. \
-                 Links appear once epsilon_graph exists in swarmsim."
+                "The swarm on station: squads, roles, grid cells and the \
+                 comm graph (epsilon graph, decision D00)."
             }
             Mission::M1 => "Which drones report, and the labels propagated to the silent ones.",
             Mission::M2 => "Embeddings learned from the traffic log, coloured by role or squad.",

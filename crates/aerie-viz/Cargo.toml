@@ -7,6 +7,7 @@ description = "Interactive window to look at SwarmSim swarms and, later, every m
 
 [dependencies]
 swarmsim = { path = "../swarmsim" }
+aerie-graph = { path = "../aerie-graph" }
 eframe = { workspace = true }
 rand = { workspace = true }
 rand_chacha = { workspace = true }

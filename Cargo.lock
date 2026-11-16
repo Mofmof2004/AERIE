@@ -143,6 +143,7 @@ dependencies = [
 name = "aerie-viz"
 version = "0.1.0"
 dependencies = [
+ "aerie-graph",
  "eframe",
  "rand",
  "rand_chacha",

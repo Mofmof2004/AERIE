@@ -1,5 +1,6 @@
 //! The arena map: cells, squads, radio ranges and drones, with zoom and pan.
 
+use aerie_graph::EdgeList;
 use eframe::egui::{
     self, Align2, Color32, FontId, Painter, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2, pos2, vec2,
 };
@@ -66,6 +67,26 @@ impl RangeCircles {
     }
 }
 
+/// What the colour of a link encodes. Width always encodes the weight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkColor {
+    /// Red (weak) to green (strong).
+    Weight,
+    /// Links inside a squad in the squad colour, links between squads highlighted.
+    Squad,
+}
+
+impl LinkColor {
+    pub const ALL: [LinkColor; 2] = [LinkColor::Weight, LinkColor::Squad];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LinkColor::Weight => "Weight",
+            LinkColor::Squad => "Inside / between squads",
+        }
+    }
+}
+
 /// Map layers the user can switch on and off.
 pub struct Layers {
     pub color_by: ColorBy,
@@ -76,6 +97,9 @@ pub struct Layers {
     pub ids: bool,
     pub ranges: RangeCircles,
     pub dim_other_squads: bool,
+    /// Draw the comm graph (epsilon graph) links.
+    pub links: bool,
+    pub link_color: LinkColor,
 }
 
 impl Default for Layers {
@@ -89,6 +113,8 @@ impl Default for Layers {
             ids: false,
             ranges: RangeCircles::Selected,
             dim_other_squads: true,
+            links: true,
+            link_color: LinkColor::Squad,
         }
     }
 }
@@ -149,12 +175,15 @@ impl Transform {
 }
 
 /// Draws the map and handles zoom, pan, hover and click-to-select.
+// Eight inputs, each a separate piece of viewer state; bundling them would only move the list.
+#[allow(clippy::too_many_arguments)]
 pub fn draw(
     ui: &mut egui::Ui,
     view: &mut MapView,
     layers: &Layers,
     cfg: &SimConfig,
     swarm: &[Drone],
+    graph: &EdgeList,
     squads: &[SquadInfo],
     selected: &mut Option<usize>,
 ) {
@@ -243,6 +272,33 @@ pub fn draw(
         }
     }
 
+    // Links of the comm graph. Width = weight. With a drone selected, its links stay
+    // bright and the others fade. Skipped if the graph is out of date with the swarm.
+    if layers.links && graph.n as usize == swarm.len() {
+        for e in &graph.edges {
+            let (s, d) = (e.src as usize, e.dst as usize);
+            let (a, b) = (&swarm[s], &swarm[d]);
+            let mut color = match layers.link_color {
+                LinkColor::Weight => ramp(e.weight),
+                LinkColor::Squad if a.squad == b.squad => {
+                    squad_color(a.squad.0 as usize).gamma_multiply(0.6)
+                }
+                LinkColor::Squad => text,
+            };
+            if selected.is_some_and(|i| i != s && i != d) {
+                color = color.gamma_multiply(0.15);
+            }
+            let width = 0.5 + 2.5 * e.weight as f32;
+            painter.line_segment(
+                [
+                    t.to_screen(a.position.x, a.position.y),
+                    t.to_screen(b.position.x, b.position.y),
+                ],
+                Stroke::new(width, color),
+            );
+        }
+    }
+
     // Drones. Size grows a little with zoom so they stay readable.
     let radius = (5.0 * view.zoom.sqrt()).clamp(4.0, 12.0);
     let outline = Stroke::new(1.0, Color32::from_black_alpha(160));
@@ -299,6 +355,12 @@ pub fn draw(
     }
     if let Some(i) = response.hover_pos().and_then(near) {
         let d = &swarm[i];
+        // Links of the hovered drone: count and weighted degree.
+        let (n_links, w_degree) = graph
+            .edges
+            .iter()
+            .filter(|e| e.src as usize == i || e.dst as usize == i)
+            .fold((0, 0.0), |(n, w), e| (n + 1, w + e.weight));
         response.on_hover_ui_at_pointer(|ui| {
             ui.strong(format!("Drone {}  ·  squad S{}", d.id.0, d.squad.0));
             ui.label(format!("Role: {}", role_name(d.role)));
@@ -307,6 +369,7 @@ pub fn draw(
                 d.position.x, d.position.y
             ));
             ui.label(format!("Radio range: {:.1} km", d.role.radio_range(cfg)));
+            ui.label(format!("Links: {n_links} · weighted degree {w_degree:.2}"));
             ui.label(format!(
                 "Battery {:.2} · sensor {:.2} · compute {:.2}",
                 d.battery, d.sensor_quality, d.compute_capacity
