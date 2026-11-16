@@ -45,6 +45,28 @@ pub struct Vec2 {
     pub y: f64,
 }
 
+/// One drone: its identity and its state at one moment.
+/// Not `Copy`: changing a copy by mistake would leave the swarm unchanged.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Drone {
+    /// Stable identity, survives attrition. Not the index in the swarm vector.
+    pub id: DroneId,
+    /// The squad this drone flies with.
+    pub squad: SquadId,
+    /// What the drone does; also decides its radio range.
+    pub role: Role,
+    /// Position in the arena, km.
+    pub position: Vec2,
+    /// Velocity, km per step. Zero when the swarm is on station.
+    pub velocity: Vec2,
+    /// Battery level: 0 = empty, 1 = full.
+    pub battery: f64,
+    /// Sensor quality: 0 = useless, 1 = perfect.
+    pub sensor_quality: f64,
+    /// Compute capacity: 0 = none, 1 = the best on board.
+    pub compute_capacity: f64,
+}
+
 impl Vec2 {
     /// Euclidean distance to `other`, in km.
     pub fn dist(self, other: Vec2) -> f64 {
