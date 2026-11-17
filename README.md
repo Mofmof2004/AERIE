@@ -10,11 +10,11 @@ Design decisions and the evidence behind them are in [DECISIONS.md](DECISIONS.md
 ```
 AERIE/
 ├── Cargo.toml              workspace: members, shared dependency versions
-├── DECISIONS.md            decision log: D00 ground rules, D01 epsilon-graph tuning, ...
+├── DECISIONS.md            decision log: D00 ground rules, D01 epsilon-graph tuning, D02 jamming, ...
 ├── crates/
 │   ├── aerie-graph/        graph storage: Edge, EdgeList, degrees, neighbours, components
 │   ├── swarmsim/           the simulator (Mission 0)
-│   │   ├── examples/       small programs using the crate, e.g. epsilon_stats.rs
+│   │   ├── examples/       small programs using the crate, epsilon_stats.rs, jamming_stats.rs
 │   │   └── src/
 │   │       ├── config.rs   SimConfig: squads, arena, cells, radio ranges, k, jamming (P0, d0, ridge factor, threshold, noise)
 │   │       ├── drone.rs    DroneId, SquadId, Role, Vec2, Drone
@@ -59,6 +59,7 @@ Small programs in `crates/swarmsim/examples/`. Run with `--release`.
 | Example | Command | What it prints |
 |---|---|---|
 | ε-graph stats | `cargo run --release -p swarmsim --example epsilon_stats` | one row per seed: links, mean degree, components, largest, isolated, share between squads; then the mean and the targets (D01) |
+| Jamming stats | `cargo run --release -p swarmsim --example jamming_stats` | step 2 end to end, one row per seed: jammed share, relays jammed, links lost, pieces, stranded drones, readings on the wrong side; then the summary (D02) |
 
 ## GUIs
 

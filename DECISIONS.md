@@ -96,3 +96,69 @@ uses the same list.
 There are two kinds of split:
 - **One stray drone** (largest component 99): seeds 10, 18, 54, 92.
 - **Whole squads cut off** (largest component 50–90): seeds 2, 30, 63, 79, 87, 90.
+
+---
+
+## D02. Jamming: placement, readings, labels, link failure
+
+```
+Chose:     one jammer + one ridge per seed, redrawn until 5-30 % of drones are jammed;
+           labels and link failure from the true power; readings = truth + noise, not clamped
+Rejected:  jammer placed near a squad; a fixed jammed share; labels from readings;
+           clamped readings; removing jammed drones from the graph
+Evidence:  cargo run --release -p swarmsim --example jamming_stats  (seeds 0-99)
+Cost:      jamming splits the free drones on 37 / 100 seeds; few drones sit near the threshold
+Revisit:   several jammers (combine rule), moving jammers (step 4), M1 if labels are too easy
+```
+
+**Units.** P0 = 1, so every power is a fraction of the jammer's power at its own position.
+The threshold is `jam_threshold * jam_p0` (0.5 P0). P0 cancels out of who is jammed: doubling
+it doubles every power and the threshold.
+
+**Field** (`jam_power`). P(d) = P0 / (1 + (d / d0)²) with d0 = 4 km, so the power is half of
+P0 at d0. It is multiplied by 0.1 when the straight line from the jammer to the point crosses
+the ridge (`segments_cross`, strict test: touching the ridge does not shadow).
+
+**Placement** (`place_jamming`, rejection sampling, after `spawn_swarm` with the same RNG).
+- Jammer uniform in the arena, power P0.
+- Ridge middle 2 to 3 km from the jammer in a random direction, the ridge roughly facing it
+  (perpendicular ± 0.5 rad), 10 to 14 km long.
+- Kept only if 5 % to 30 % of the drones are jammed; otherwise both are drawn again.
+  Panics after 10,000 attempts so a bad config cannot loop forever.
+- Rejected: placing the jammer near a squad. Rejection sampling gives the same control over
+  the jammed share with fewer special cases.
+
+**Truth, readings, labels.**
+- `true_power`: the exact power at each drone. The simulator keeps it for every error metric.
+- `readings`: truth + Normal(0, noise_sd · P0), noise_sd = 0.1, for **every** drone, jammed or
+  not. Not clamped: a reading can be slightly negative. Drawn after placement with the same RNG.
+- `jammed_labels`: jammed when the **true** power is **at or above** 0.5 P0. The plan says
+  "above"; `>=` matches its "dead zone of radius d0" (exactly 0.5 P0 at d0). Equality never
+  happens in practice.
+- Labels come from the truth, never the readings: they are the answer key.
+
+**Link failure** (`fail_links`). A link fails when either end is jammed (from the labels, so
+from the truth). `n` is unchanged: jammed drones stay as isolated nodes, so drone `i` is still
+index `i` and the labels line up.
+
+**Several jammers.** Not needed yet: every seed has one. The jamming playground can sum or take
+the max. Noise powers add, so **sum** is the likely choice. To decide when a mission needs two.
+
+**Result over seeds 0–99**
+
+| | Value |
+| --- | --- |
+| Jammed share | min 5 %, mean 9.6 %, max 19 % (the 30 % cap is never reached) |
+| Relays jammed per seed | 1.9 of 20 (the same share as other drones) |
+| Links lost | 13.1 % |
+| Free drones split into 2+ pieces | 37 / 100 seeds (10 / 100 before jamming) |
+| Free drones outside the largest piece | 3.7 per seed |
+| Readings on the wrong side of the threshold | 1.8 drones per seed |
+
+**What this means for later missions.**
+- Jamming opens a real hole: about one link in eight is lost, and on a third of the seeds the
+  free drones split. M8's split warning has positive examples.
+- Most drones sit far from the threshold, so on average fewer than 2 per seed have a reading
+  that contradicts their label. Classifying "jammed" from one's own reading is easy.
+  M1 hides 90 % of the readings, which is where the graph has to do the work. If M1 still
+  turns out too easy, raise noise_sd or label from a softer zone.
