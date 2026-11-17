@@ -2,6 +2,7 @@
 
 use crate::config::SimConfig;
 use crate::drone::{Drone, Vec2};
+use aerie_graph::{Edge, EdgeList};
 use rand::RngExt;
 use rand_chacha::ChaCha8Rng;
 use rand_distr::{Distribution, Normal};
@@ -149,6 +150,10 @@ pub fn readings(truth: &[f64], config: &SimConfig, rng: &mut ChaCha8Rng) -> Vec<
     reading
 }
 
+/// The zone label of each drone: `true` (jammed) when its true power is at least
+/// `jam_threshold * jam_p0`, in the same order as `truth`.
+///
+/// Computed from the truth, not the readings: this is the answer the model is scored against.
 pub fn jammed_labels(truth: &[f64], config: &SimConfig) -> Vec<bool> {
     let mut zone_label = Vec::new();
     for &power in truth {
@@ -161,6 +166,27 @@ pub fn jammed_labels(truth: &[f64], config: &SimConfig) -> Vec<bool> {
 
     zone_label
 }
+
+/// The comm graph after jamming: a link fails when either of its ends is jammed
+/// (Project_Plan: "jamming power at either end above 0.5 P0").
+///
+/// `jammed` is one flag per drone, from `jammed_labels` (so from the truth, not the
+/// readings). `n` is unchanged: jammed drones stay in the graph as isolated nodes, so
+/// drone `i` is still index `i`.
+pub fn fail_links(graph: &EdgeList, jammed: &[bool]) -> EdgeList {
+    let n: u32 = graph.n;
+    let mut edges_survived: Vec<Edge> = Vec::new();
+    for edge in &graph.edges {
+        if !(jammed[edge.src as usize] || jammed[edge.dst as usize]) {
+            edges_survived.push(edge.clone());
+        }
+    }
+    EdgeList {
+        n,
+        edges: edges_survived,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -599,5 +625,102 @@ mod tests {
             assert_eq!(share, jammed_share(&swarm, &j, &r, &cfg));
             assert!((cfg.jam_frac_min..=cfg.jam_frac_max).contains(&share));
         }
+    }
+
+    // ---------------------------------------------------------- 2d: link failure
+
+    /// Path 0 - 1 - 2 - 3 plus the link 1 - 3, weights 0.1 to 0.4.
+    fn small_graph() -> EdgeList {
+        let e = |src, dst, weight| Edge { src, dst, weight };
+        EdgeList {
+            n: 4,
+            edges: vec![e(0, 1, 0.1), e(1, 2, 0.2), e(2, 3, 0.3), e(1, 3, 0.4)],
+        }
+    }
+
+    #[test]
+    fn nothing_jammed_keeps_every_link() {
+        let g = small_graph();
+        assert_eq!(fail_links(&g, &[false; 4]), g);
+    }
+
+    #[test]
+    fn everything_jammed_keeps_no_link_but_every_node() {
+        let after = fail_links(&small_graph(), &[true; 4]);
+        assert!(after.edges.is_empty());
+        assert_eq!(after.n, 4);
+    }
+
+    #[test]
+    fn a_link_fails_when_either_end_is_jammed() {
+        // Drone 1 jammed: 0-1, 1-2 and 1-3 fail; 2-3 survives, with its weight.
+        let after = fail_links(&small_graph(), &[false, true, false, false]);
+        assert_eq!(
+            after.edges,
+            vec![Edge {
+                src: 2,
+                dst: 3,
+                weight: 0.3
+            }]
+        );
+    }
+
+    #[test]
+    fn prediction_1_a_jammed_drone_ends_with_degree_0() {
+        let cfg = SimConfig::default();
+        let (swarm, j, r) = placed(2, &cfg);
+        let graph = crate::graphs::epsilon::epsilon_graph(&swarm, &cfg);
+        let jammed = jammed_labels(&true_power(&swarm, &j, &r, &cfg), &cfg);
+        let degrees = fail_links(&graph, &jammed).degrees();
+        for (i, &is_jammed) in jammed.iter().enumerate() {
+            if is_jammed {
+                assert_eq!(degrees[i], 0.0, "jammed drone {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn prediction_2_components_never_go_down() {
+        // Removing links can only split components, never merge them.
+        let cfg = SimConfig::default();
+        for seed in 0..20 {
+            let (swarm, j, r) = placed(seed, &cfg);
+            let graph = crate::graphs::epsilon::epsilon_graph(&swarm, &cfg);
+            let jammed = jammed_labels(&true_power(&swarm, &j, &r, &cfg), &cfg);
+            let after = fail_links(&graph, &jammed);
+            let count = |g: &EdgeList| g.components().iter().max().map_or(0, |&c| c + 1);
+            assert!(count(&after) >= count(&graph), "seed {seed}");
+            // Every jammed drone is now isolated, so there are strictly more pieces.
+            assert!(count(&after) > count(&graph), "seed {seed}");
+        }
+    }
+
+    #[test]
+    fn prediction_3_free_drones_keep_their_link_next_to_jammed_ones() {
+        // 0 and 3 jammed; 1 and 2 are free but each touches a jammed drone.
+        // Only 1-2 survives.
+        let g = EdgeList {
+            n: 4,
+            edges: vec![
+                Edge {
+                    src: 0,
+                    dst: 1,
+                    weight: 0.5,
+                },
+                Edge {
+                    src: 1,
+                    dst: 2,
+                    weight: 0.5,
+                },
+                Edge {
+                    src: 2,
+                    dst: 3,
+                    weight: 0.5,
+                },
+            ],
+        };
+        let after = fail_links(&g, &[true, false, false, true]);
+        assert_eq!(after.edges.len(), 1);
+        assert_eq!((after.edges[0].src, after.edges[0].dst), (1, 2));
     }
 }

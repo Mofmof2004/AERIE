@@ -19,7 +19,7 @@ AERIE/
 │   │       ├── config.rs   SimConfig: squads, arena, cells, radio ranges, k, jamming (P0, d0, ridge factor, threshold, noise)
 │   │       ├── drone.rs    DroneId, SquadId, Role, Vec2, Drone
 │   │       ├── spawn.rs    spawn_swarm: places the squads and drones
-│   │       ├── jamming.rs  Jammer, Ridge, jam_power (falloff, ridge shadow), place_jamming (D02), true_power, readings, jammed_labels
+│   │       ├── jamming.rs  Jammer, Ridge, jam_power (falloff, ridge shadow), place_jamming (D02), true_power, readings, jammed_labels, fail_links
 │   │       ├── graphs.rs   declares the graph modules below
 │   │       └── graphs/
 │   │           ├── epsilon/   epsilon_graph (D00 rule), textbook_epsilon_graph, tests
@@ -165,7 +165,7 @@ real `swarmsim::jamming::jam_power` at every pixel (0.2 km).
   Hover a drone for its truth, reading and noise.
 - **Right panel:** power against distance (open ground and behind the ridge), the value table,
   the power at the cursor per jammer (clear or blocked), the effect on the swarm before
-  and after jamming (links, mean degree, components, isolated drones), and readings against
+  and after jamming from `fail_links` (links, mean degree, components, isolated drones), and readings against
   truth: counts per colour, the measured noise (mean, sd), and a scatter plot of truth (x)
   against reading (y) for every drone. Hover a dot to ring that drone on the map.
 

@@ -10,7 +10,8 @@
 //! "Place from seed" runs `place_jamming` on the chosen seed's swarm, exactly as the
 //! dataset will: spawn the swarm, then place jammer and ridge with the same RNG.
 //! Readings (2c): each drone's true power comes from your `true_power`, its sensor
-//! reading from your `readings`, its label from your `jammed_labels`. Drones can be coloured by label against reading, and
+//! reading from your `readings`, its label from your `jammed_labels`. The "after"
+//! graph in the right panel comes from your `fail_links`. Drones can be coloured by label against reading, and
 //! a scatter plot shows truth against reading for every drone.
 
 use aerie_graph::EdgeList;
@@ -25,7 +26,7 @@ use swarmsim::drone::{Drone, Vec2};
 use swarmsim::graphs::epsilon::epsilon_graph;
 use swarmsim::graphs::stats::stats;
 use swarmsim::jamming::{
-    Jammer, Ridge, jam_power, jammed_labels, place_jamming, readings, true_power,
+    Jammer, Ridge, fail_links, jam_power, jammed_labels, place_jamming, readings, true_power,
 };
 use swarmsim::spawn::spawn_swarm;
 
@@ -374,20 +375,6 @@ impl JamApp {
     /// Jammed flag per drone (the zone label), from your `jammed_labels`.
     fn jammed(&self) -> Vec<bool> {
         jammed_labels(&self.truth(), &self.config)
-    }
-
-    /// The comm graph after link failure: links with a jammed end are removed.
-    fn surviving_graph(&self, jammed: &[bool]) -> EdgeList {
-        EdgeList {
-            n: self.graph.n,
-            edges: self
-                .graph
-                .edges
-                .iter()
-                .filter(|e| !jammed[e.src as usize] && !jammed[e.dst as usize])
-                .cloned()
-                .collect(),
-        }
     }
 
     /// Same geometry as the unit tests, moved by (10, 10): jammer at (10, 10),
@@ -980,7 +967,7 @@ impl JamApp {
         let jammed = self.jammed();
         let n_jammed = jammed.iter().filter(|&&j| j).count();
         let before = stats(&self.graph, &self.swarm);
-        let after_graph = self.surviving_graph(&jammed);
+        let after_graph = fail_links(&self.graph, &jammed);
         let after = stats(&after_graph, &self.swarm);
         egui::Grid::new("swarm_effect")
             .striped(true)
@@ -1953,7 +1940,7 @@ mod tests {
         app.jammers[0].position = app.swarm[0].position;
         let jammed = app.jammed();
         assert!(jammed[0]);
-        let after = app.surviving_graph(&jammed);
+        let after = fail_links(&app.graph, &jammed);
         assert!(
             after
                 .edges
