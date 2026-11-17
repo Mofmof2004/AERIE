@@ -76,6 +76,13 @@ pub struct SimConfig {
     pub task_near_frac: f64,
     /// A near task lies within this many km of a random drone, in x and in y.
     pub task_near_radius: f64,
+    /// Cost of an empty battery, in km of travel (step 3c): the cost adds
+    /// `cost_beta * (1 - battery)`. Batteries spawn in 0.5..1, so it adds 0 to 1.5 km.
+    pub cost_beta: f64,
+    /// Cost added when a drone cannot take a task (role does not fit, or no relay within
+    /// 2 hops for Observe and Track). Larger than any real cost, but finite so the
+    /// Hungarian solver (step 3d) still has a number in every cell.
+    pub cost_penalty: f64,
 }
 
 impl Default for SimConfig {
@@ -106,6 +113,8 @@ impl Default for SimConfig {
             n_tasks: 50,
             task_near_frac: 0.5,
             task_near_radius: 3.0,
+            cost_beta: 3.0,
+            cost_penalty: 1000.0,
         }
     }
 }

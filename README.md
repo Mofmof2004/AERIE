@@ -21,6 +21,7 @@ AERIE/
 │   │       ├── spawn.rs    spawn_swarm: places the squads and drones
 │   │       ├── jamming.rs  Jammer, Ridge, jam_power (falloff, ridge shadow), place_jamming (D02), true_power, readings, jammed_labels, fail_links
 │   │       ├── links.rs    the link model (D03): margin, LiveGraph, live_graph
+│   │       ├── tasks.rs    TaskId, TaskKind (can_do, needs_relay, able), Task, spawn_tasks, relay_within_two_hops, CostMatrix, cost_matrix
 │   │       ├── graphs.rs   declares the graph modules below
 │   │       └── graphs/
 │   │           ├── epsilon/   epsilon_graph (D00 rule), textbook_epsilon_graph, tests
@@ -91,7 +92,16 @@ is built in the dataset order with one RNG: `spawn_swarm`, `place_jamming`, `tru
   Filled = placed near a drone, hollow = uniform. Hover a task for its roles, the number of
   drones that can take it and the nearest one. Click a task: drones whose role can take it get
   a ring in its colour, the others fade. The right panel counts tasks per kind and lists the
-  5 closest drones able to take the selected task (click one to select it).
+  5 closest drones whose role fits the selected task (click one to select it).
+- **Relay rule (step 3b):** Observe and Track need a relay within 2 hops on the live graph
+  (`relay_within_two_hops`). Click one of those tasks: drones whose role fits but that fail
+  the rule get a faint ring and a **red cross**. The task table shows *By role* and *Able*
+  (role and relay rule), the hover says how many are cut off, and the selected drone shows
+  *Relay ≤ 2 hops*. On seeds 0–99 about 97 % of drones pass.
+- **Costs (step 3c):** the selected task lists its 5 cheapest drones from the cost matrix,
+  with the cost split into km + battery term (+ penalty when not able). The cheapest (BEST)
+  gets a **gold star** on the map and a gold dashed line from the task: the future
+  single-winner label. β and the penalty are in *Settings → Tasks and costs*.
 
 - **Left panel:** mission, seed (◀ ▶ to step), cell size, squad count and size, spread, radio ranges, layers, legend.
 - **Menu bar:** *Playgrounds* opens any GUI (graph playground, jamming playground, another swarm

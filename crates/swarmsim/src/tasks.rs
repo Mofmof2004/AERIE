@@ -93,6 +93,13 @@ impl TaskKind {
     pub fn needs_relay(self) -> bool {
         matches!(self, TaskKind::Observe | TaskKind::Track)
     }
+
+    /// Whether a drone can really take the task: its role fits (`can_do`) and, when the
+    /// relay rule applies, it has a relay within 2 hops (`relay_ok`, from
+    /// `relay_within_two_hops`). A drone that is not able pays the penalty in the cost.
+    pub fn able(self, role: Role, relay_ok: bool) -> bool {
+        self.can_do(role) && (!self.needs_relay() || relay_ok)
+    }
 }
 
 /// The tasks of one snapshot: `n_tasks` tasks with a random kind. The first
@@ -182,6 +189,72 @@ pub fn relay_within_two_hops(live: &EdgeList, swarm: &[Drone]) -> Vec<bool> {
         result.push(found);
     }
     result
+}
+
+/// What every drone would cost for every task (step 3c): the input of the oracle labels
+/// (step 3d), and later of the regret in Mission 5.
+///
+/// Rows are tasks, columns are drones, because the Hungarian solver needs no more rows
+/// than columns (50 tasks, 100 drones). Stored as one flat `Vec`, row after row
+/// ("row-major"): the cost of drone `d` for task `t` sits at `t * n_drones + d`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CostMatrix {
+    /// Rows.
+    pub n_tasks: usize,
+    /// Columns.
+    pub n_drones: usize,
+    /// `n_tasks * n_drones` costs, row 0 first.
+    pub data: Vec<f64>,
+}
+
+impl CostMatrix {
+    /// Cost of drone `drone` (its index in the swarm) for task `task`.
+    pub fn get(&self, task: usize, drone: usize) -> f64 {
+        self.data[task * self.n_drones + drone]
+    }
+
+    /// Every drone's cost for one task: row `task`, as a slice of the flat data.
+    pub fn row(&self, task: usize) -> &[f64] {
+        let start = task * self.n_drones;
+        &self.data[start..start + self.n_drones]
+    }
+}
+
+/// The cost of drone i taking task j:
+///
+/// `c_ij = distance_ij + cost_beta * (1 - battery_i) + penalty_ij`
+///
+/// - distance in km stands for travel time (one speed for every drone);
+/// - the battery term makes a tired drone look further away (up to 1.5 km by default);
+/// - the penalty (`cost_penalty`) is added when the drone is not `able` to take the task:
+///   wrong role, or no relay within 2 hops for Observe and Track.
+///
+/// `relay_ok` is `relay_within_two_hops` on the live graph, one entry per drone.
+pub fn cost_matrix(
+    swarm: &[Drone],
+    tasks: &[Task],
+    relay_ok: &[bool],
+    config: &SimConfig,
+) -> CostMatrix {
+    // Tasks outside, drones inside: the pushes come out row by row.
+    let mut data = Vec::with_capacity(tasks.len() * swarm.len());
+    for task in tasks {
+        for (i, drone) in swarm.iter().enumerate() {
+            let travel = drone.position.dist(task.position);
+            let tired = config.cost_beta * (1.0 - drone.battery);
+            let penalty = if task.kind.able(drone.role, relay_ok[i]) {
+                0.0
+            } else {
+                config.cost_penalty
+            };
+            data.push(travel + tired + penalty);
+        }
+    }
+    CostMatrix {
+        n_tasks: tasks.len(),
+        n_drones: swarm.len(),
+        data,
+    }
 }
 
 #[cfg(test)]
@@ -467,6 +540,152 @@ mod tests {
         let geometric = crate::graphs::epsilon::epsilon_graph(&swarm, cfg);
         let live = crate::links::live_graph(&geometric, &swarm, &truth, cfg).graph;
         (swarm, live)
+    }
+
+    /// One task of `kind` at (x, 0).
+    fn task_at(kind: TaskKind, x: f64) -> Task {
+        Task {
+            id: TaskId(0),
+            kind,
+            position: Vec2 { x, y: 0.0 },
+        }
+    }
+
+    #[test]
+    fn able_combines_role_and_relay_rule() {
+        // Observe needs the relay rule; Fuse does not.
+        assert!(TaskKind::Observe.able(Role::Recon, true));
+        assert!(!TaskKind::Observe.able(Role::Recon, false));
+        assert!(!TaskKind::Observe.able(Role::Compute, true));
+        assert!(TaskKind::Fuse.able(Role::Compute, false));
+        assert!(!TaskKind::Fuse.able(Role::Recon, true));
+    }
+
+    #[test]
+    fn prediction_hand_cost() {
+        // 2 km away, battery 0.6, beta 3, able: 2 + 3 * 0.4 = 3.2.
+        let cfg = SimConfig::default();
+        let mut swarm = row(1, &[]);
+        swarm[0].battery = 0.6;
+        let c = cost_matrix(&swarm, &[task_at(TaskKind::Observe, 2.0)], &[true], &cfg);
+        assert!((c.get(0, 0) - 3.2).abs() < 1e-12, "{}", c.get(0, 0));
+    }
+
+    #[test]
+    fn penalty_for_wrong_role_and_for_no_relay_only_where_it_applies() {
+        let cfg = SimConfig::default();
+        // Drone 0 recon, drone 1 compute, both on the task, full battery: real cost 0.
+        let mut swarm = row(2, &[]);
+        swarm[1].role = Role::Compute;
+        swarm[1].position = Vec2 { x: 0.0, y: 0.0 };
+        let tasks = [
+            task_at(TaskKind::Observe, 0.0),
+            task_at(TaskKind::Fuse, 0.0),
+        ];
+        let p = cfg.cost_penalty;
+        // Relay rule passes for both.
+        let c = cost_matrix(&swarm, &tasks, &[true, true], &cfg);
+        assert_eq!(c.row(0), [0.0, p]); // Observe: recon able, compute wrong role
+        assert_eq!(c.row(1), [p, 0.0]); // Fuse: recon wrong role, compute able
+        // Relay rule fails for both: Observe now penalises the recon drone too,
+        // Fuse does not care.
+        let c = cost_matrix(&swarm, &tasks, &[false, false], &cfg);
+        assert_eq!(c.row(0), [p, p]);
+        assert_eq!(c.row(1), [p, 0.0]);
+    }
+
+    #[test]
+    fn row_major_layout() {
+        // 3 tasks x 4 drones; drone d at x = d, task t at x = 10 t, all able (recon,
+        // Observe, relay ok), full battery: cost = |10 t - d|.
+        let cfg = SimConfig::default();
+        let swarm = row(4, &[]);
+        let tasks: Vec<Task> = (0..3)
+            .map(|t| task_at(TaskKind::Observe, 10.0 * t as f64))
+            .collect();
+        let c = cost_matrix(&swarm, &tasks, &[true; 4], &cfg);
+        assert_eq!((c.n_tasks, c.n_drones, c.data.len()), (3, 4, 12));
+        for t in 0..3 {
+            for d in 0..4 {
+                let expected = (10.0 * t as f64 - d as f64).abs();
+                assert_eq!(c.get(t, d), expected);
+                assert_eq!(c.data[t * 4 + d], expected);
+                assert_eq!(c.row(t)[d], expected);
+            }
+        }
+    }
+
+    #[test]
+    fn battery_breaks_a_tie_in_distance() {
+        // Two recon drones 1 km from the task, one at battery 0.5 and one full.
+        let cfg = SimConfig::default();
+        let mut swarm = row(2, &[]);
+        swarm[0].position = Vec2 { x: 1.0, y: 0.0 };
+        swarm[1].position = Vec2 { x: -1.0, y: 0.0 };
+        swarm[0].battery = 0.5;
+        let c = cost_matrix(&swarm, &[task_at(TaskKind::Track, 0.0)], &[true; 2], &cfg);
+        assert!(c.get(0, 1) < c.get(0, 0));
+        assert!((c.get(0, 0) - c.get(0, 1) - 1.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn real_seeds_penalty_exactly_where_not_able_and_dwarfs_real_costs() {
+        let cfg = SimConfig::default();
+        // The largest real cost: arena diagonal plus an empty battery.
+        let max_real = cfg.arena_w.hypot(cfg.arena_h) + cfg.cost_beta;
+        assert!(max_real < cfg.cost_penalty);
+        for seed in 0..10 {
+            let (swarm, live) = live_snapshot(seed, &cfg);
+            let tasks = spawn_tasks(&swarm, &cfg, &mut ChaCha8Rng::seed_from_u64(seed));
+            let ok = relay_within_two_hops(&live, &swarm);
+            let c = cost_matrix(&swarm, &tasks, &ok, &cfg);
+            assert_eq!(c.data.len(), tasks.len() * swarm.len());
+            for (t, task) in tasks.iter().enumerate() {
+                for (d, drone) in swarm.iter().enumerate() {
+                    let cost = c.get(t, d);
+                    assert!(cost >= 0.0);
+                    if task.kind.able(drone.role, ok[d]) {
+                        assert!(cost <= max_real, "seed {seed} task {t} drone {d}");
+                    } else {
+                        assert!(cost >= cfg.cost_penalty);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn print_cost_stats() {
+        // Per seed: tasks with no able drone, and the cheapest able cost per task.
+        let cfg = SimConfig::default();
+        let (mut no_able, mut n_tasks) = (0, 0);
+        let mut cheapest = Vec::new();
+        for seed in 0..100 {
+            let (swarm, live) = live_snapshot(seed, &cfg);
+            let tasks = spawn_tasks(&swarm, &cfg, &mut ChaCha8Rng::seed_from_u64(seed));
+            let ok = relay_within_two_hops(&live, &swarm);
+            let c = cost_matrix(&swarm, &tasks, &ok, &cfg);
+            for t in 0..c.n_tasks {
+                n_tasks += 1;
+                let best = c.row(t).iter().copied().fold(f64::INFINITY, f64::min);
+                if best >= cfg.cost_penalty {
+                    no_able += 1;
+                } else {
+                    cheapest.push(best);
+                }
+            }
+        }
+        cheapest.sort_by(f64::total_cmp);
+        let q = |f: f64| cheapest[((cheapest.len() - 1) as f64 * f) as usize];
+        println!("tasks {n_tasks}, with no able drone {no_able}");
+        println!(
+            "cheapest able cost: min {:.2} median {:.2} p90 {:.2} max {:.2}",
+            q(0.0),
+            q(0.5),
+            q(0.9),
+            q(1.0)
+        );
     }
 
     #[test]

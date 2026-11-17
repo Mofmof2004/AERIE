@@ -11,7 +11,7 @@ use swarmsim::config::SimConfig;
 use swarmsim::drone::{Drone, Role};
 use swarmsim::jamming::{Jammer, Ridge, jam_power};
 use swarmsim::links::LiveGraph;
-use swarmsim::tasks::{Task, TaskKind};
+use swarmsim::tasks::{CostMatrix, Task, TaskKind};
 
 use crate::squads::SquadInfo;
 use crate::style::{draw_drone, ramp, role_color, role_name, squad_color};
@@ -126,6 +126,10 @@ pub struct Snapshot {
     pub labels: Vec<bool>,
     pub live: LiveGraph,
     pub tasks: Vec<Task>,
+    /// Relay rule (step 3b): a relay within 2 hops on the live graph, per drone.
+    pub relay_ok: Vec<bool>,
+    /// Step 3c: cost of every drone for every task (rows tasks, columns drones).
+    pub costs: CostMatrix,
     /// Jamming power on a grid of FIELD_RES km cells (row 0 at y = 0), for the shading.
     pub field: Vec<f64>,
 }
@@ -195,6 +199,10 @@ pub fn n_near_tasks(cfg: &SimConfig) -> usize {
 const JAMMER_COLOR: Color32 = Color32::from_rgb(230, 60, 60);
 const RIDGE_COLOR: Color32 = Color32::from_rgb(170, 120, 70);
 const ZONE_COLOR: Color32 = Color32::from_rgb(255, 70, 70);
+/// Star on the cheapest drone for the selected task (the single winner, step 3c/3d).
+pub const WINNER_COLOR: Color32 = Color32::from_rgb(255, 200, 40);
+/// Cross on drones whose role fits the selected task but that fail the relay rule.
+pub const RELAY_FAIL_COLOR: Color32 = Color32::from_rgb(255, 70, 70);
 /// Drones in the jammed zone: lime, used by no squad, role or task kind.
 pub const JAMMED_DRONE_COLOR: Color32 = Color32::from_rgb(200, 255, 0);
 
@@ -524,14 +532,33 @@ pub fn draw(
         if jammed {
             fill = JAMMED_DRONE_COLOR;
         }
+        // Role fits, but the task needs a relay within 2 hops and this drone has none.
+        let cut_off = task_kind.is_some_and(|k| {
+            k.can_do(d.role)
+                && k.needs_relay()
+                && snap.is_some_and(|s| s.relay_ok.get(i) == Some(&false))
+        });
         if task_kind.is_some_and(|k| !k.can_do(d.role)) {
             fill = fill.gamma_multiply(0.2);
+        }
+        if cut_off {
+            fill = fill.gamma_multiply(0.5);
         }
         draw_drone(&painter, c, radius, d.role, fill, outline);
         if let Some(k) = task_kind
             && k.can_do(d.role)
         {
-            painter.circle_stroke(c, radius + 4.0, Stroke::new(2.0, task_color(k)));
+            if cut_off {
+                // Faint ring (the role fits) and a red cross (the relay rule fails).
+                let ring = task_color(k).gamma_multiply(0.35);
+                painter.circle_stroke(c, radius + 4.0, Stroke::new(1.5, ring));
+                let k = radius + 3.0;
+                let cross = Stroke::new(2.5, RELAY_FAIL_COLOR);
+                painter.line_segment([c - vec2(k, k), c + vec2(k, k)], cross);
+                painter.line_segment([c + vec2(-k, k), c + vec2(k, -k)], cross);
+            } else {
+                painter.circle_stroke(c, radius + 4.0, Stroke::new(2.0, task_color(k)));
+            }
         }
         if jammed {
             painter.circle_stroke(c, radius + 2.5, Stroke::new(1.5, JAMMED_DRONE_COLOR));
@@ -611,6 +638,25 @@ pub fn draw(
         }
     }
 
+    // The cheapest drone for the selected task: a gold dashed line from the task and a
+    // gold star on the drone. This is the single-winner label of step 3d.
+    if layers.tasks
+        && let Some(s) = snap
+        && let Some(k) = *selected_task
+        && let Some(task) = s.tasks.get(k)
+        && let Some(w) = cheapest_drone(s, k)
+    {
+        let from = t.to_screen(task.position.x, task.position.y);
+        let to = t.to_screen(swarm[w].position.x, swarm[w].position.y);
+        painter.extend(Shape::dashed_line(
+            &[from, to],
+            Stroke::new(2.0, WINNER_COLOR),
+            6.0,
+            4.0,
+        ));
+        draw_star(&painter, to + vec2(0.0, -radius - 9.0), 8.0, WINNER_COLOR);
+    }
+
     // Selection ring.
     if let Some(d) = selected.and_then(|i| swarm.get(i)) {
         let c = t.to_screen(d.position.x, d.position.y);
@@ -641,10 +687,14 @@ pub fn draw(
             .map(role_name)
             .collect();
         let qualified = swarm.iter().filter(|d| task.kind.can_do(d.role)).count();
-        let nearest = swarm
-            .iter()
-            .filter(|d| task.kind.can_do(d.role))
-            .map(|d| (d.id.0, d.position.dist(task.position)))
+        // Able = role fits and, for Observe and Track, a relay within 2 hops.
+        let able = |i: usize| {
+            task.kind.can_do(swarm[i].role) && (!task.kind.needs_relay() || s.relay_ok[i])
+        };
+        let n_able = (0..swarm.len()).filter(|&i| able(i)).count();
+        let nearest = (0..swarm.len())
+            .filter(|&i| able(i))
+            .map(|i| (swarm[i].id.0, swarm[i].position.dist(task.position)))
             .min_by(|a, b| a.1.total_cmp(&b.1));
         let near = k < n_near_tasks(cfg);
         response.on_hover_ui_at_pointer(|ui| {
@@ -660,11 +710,14 @@ pub fn draw(
                 }
             ));
             ui.label(format!("Roles: {}  ({qualified} drones)", roles.join(", ")));
-            if let Some((id, dist)) = nearest {
-                ui.label(format!("Nearest of them: drone {id}, {dist:.2} km"));
-            }
             if task.kind.needs_relay() {
-                ui.weak("Relay rule applies (step 3b): needs a relay within 2 hops.");
+                ui.label(format!(
+                    "Relay within 2 hops: {n_able} of them ({} cut off, red cross)",
+                    qualified - n_able
+                ));
+            }
+            if let Some((id, dist)) = nearest {
+                ui.label(format!("Nearest able drone: {id}, {dist:.2} km"));
             }
             ui.weak("Click to highlight the drones that can take it");
         });
@@ -769,6 +822,44 @@ fn draw_jammer(painter: &Painter, c: Pos2) {
 }
 
 /// Points on a circle, closed.
+/// Index of the drone with the lowest cost for task `k` (row `k` of the cost matrix).
+pub fn cheapest_drone(snap: &Snapshot, k: usize) -> Option<usize> {
+    if k >= snap.costs.n_tasks {
+        return None;
+    }
+    snap.costs
+        .row(k)
+        .iter()
+        .enumerate()
+        .min_by(|a, b| a.1.total_cmp(b.1))
+        .map(|(i, _)| i)
+}
+
+/// A filled five-pointed star centred on `c`, outer radius `r`, with a dark outline.
+/// Drawn as a fan of triangles from the centre (a star is not convex).
+fn draw_star(painter: &Painter, c: Pos2, r: f32, color: Color32) {
+    let points: Vec<Pos2> = (0..10)
+        .map(|k| {
+            let a = -std::f32::consts::FRAC_PI_2 + k as f32 * std::f32::consts::PI / 5.0;
+            let rr = if k % 2 == 0 { r } else { r * 0.45 };
+            pos2(c.x + rr * a.cos(), c.y + rr * a.sin())
+        })
+        .collect();
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(c, color);
+    for &p in &points {
+        mesh.colored_vertex(p, color);
+    }
+    for k in 0..10u32 {
+        mesh.add_triangle(0, 1 + k, 1 + (k + 1) % 10);
+    }
+    painter.add(Shape::mesh(mesh));
+    painter.add(Shape::closed_line(
+        points,
+        Stroke::new(1.0, Color32::from_black_alpha(200)),
+    ));
+}
+
 fn circle_points(c: Pos2, r: f32, n: usize) -> Vec<Pos2> {
     (0..=n)
         .map(|k| {

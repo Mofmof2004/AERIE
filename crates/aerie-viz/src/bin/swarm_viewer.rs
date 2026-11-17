@@ -18,13 +18,14 @@ use swarmsim::graphs::stats::stats;
 use swarmsim::jamming::{jammed_labels, place_jamming, readings, true_power};
 use swarmsim::links::live_graph;
 use swarmsim::spawn::spawn_swarm;
-use swarmsim::tasks::{TaskKind, spawn_tasks};
+use swarmsim::tasks::{TaskKind, cost_matrix, relay_within_two_hops, spawn_tasks};
 
-use aerie_viz::map::{
-    self, ColorBy, JAMMED_DRONE_COLOR, Layers, LinkColor, LinkSource, MapView, RangeCircles,
-    Snapshot, jam_field, n_near_tasks, task_color, task_letter, task_name,
-};
 use aerie_viz::launch::{GUIS, launch};
+use aerie_viz::map::{
+    self, ColorBy, JAMMED_DRONE_COLOR, Layers, LinkColor, LinkSource, MapView, RELAY_FAIL_COLOR,
+    RangeCircles, Snapshot, WINNER_COLOR, jam_field, n_near_tasks, task_color, task_letter,
+    task_name,
+};
 use aerie_viz::mission::Mission;
 use aerie_viz::squads::{SquadInfo, cell_count, cell_options, squad_infos};
 use aerie_viz::style::{ramp, role_color, role_name, role_shape_name, squad_color, swatch};
@@ -387,6 +388,10 @@ impl Viewer {
                     );
                 }
             });
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("×").color(RELAY_FAIL_COLOR).strong());
+                ui.label("Role fits, but no relay within 2 hops (Observe, Track)");
+            });
         }
     }
 
@@ -635,7 +640,7 @@ impl Viewer {
                 }
             });
 
-        egui::CollapsingHeader::new("Tasks (step 3a)")
+        egui::CollapsingHeader::new("Tasks and costs (step 3)")
             .default_open(true)
             .show(ui, |ui| {
                 ui.add(egui::Slider::new(&mut cfg.n_tasks, 0..=200).text("tasks"));
@@ -649,10 +654,24 @@ impl Viewer {
                         .suffix(" km")
                         .text("near radius"),
                 );
+                ui.add(
+                    egui::Slider::new(&mut cfg.cost_beta, 0.0..=20.0)
+                        .suffix(" km")
+                        .text("β: cost of an empty battery"),
+                )
+                .on_hover_text("Cost = distance + β (1 − battery) + penalty.");
+                ui.add(
+                    egui::Slider::new(&mut cfg.cost_penalty, 10.0..=10000.0)
+                        .logarithmic(true)
+                        .text("penalty when not able"),
+                )
+                .on_hover_text("Wrong role, or no relay within 2 hops for Observe and Track.");
                 if ui.small_button("Reset group").clicked() {
                     cfg.n_tasks = d.n_tasks;
                     cfg.task_near_frac = d.task_near_frac;
                     cfg.task_near_radius = d.task_near_radius;
+                    cfg.cost_beta = d.cost_beta;
+                    cfg.cost_penalty = d.cost_penalty;
                 }
             });
 
@@ -797,7 +816,8 @@ impl Viewer {
                 ui.label("");
                 ui.label("Tasks");
                 ui.label("Near");
-                ui.label("Drones able");
+                ui.label("By role");
+                ui.label("Able");
                 ui.end_row();
                 for kind in TaskKind::ALL {
                     let of_kind: Vec<usize> = (0..s.tasks.len())
@@ -806,17 +826,27 @@ impl Viewer {
                     ui.label(RichText::new(task_name(kind)).color(task_color(kind)));
                     ui.label(of_kind.len().to_string());
                     ui.label(of_kind.iter().filter(|&&k| k < n_near).count().to_string());
-                    ui.label(
-                        self.swarm
-                            .iter()
-                            .filter(|d| kind.can_do(d.role))
-                            .count()
-                            .to_string(),
-                    );
+                    let by_role: Vec<usize> = (0..self.swarm.len())
+                        .filter(|&i| kind.can_do(self.swarm[i].role))
+                        .collect();
+                    let able = by_role
+                        .iter()
+                        .filter(|&&i| !kind.needs_relay() || s.relay_ok[i])
+                        .count();
+                    ui.label(by_role.len().to_string());
+                    ui.label(able.to_string());
                     ui.end_row();
                 }
             });
-            ui.weak("Drones able: by role only. The relay rule (3b) comes next.");
+            ui.weak(
+                "By role: the strict mapping (3a). Able: also passes the relay rule (3b), \
+                 a relay within 2 hops on the live graph, for Observe and Track.",
+            );
+            let ok = s.relay_ok.iter().filter(|&&b| b).count();
+            ui.label(format!(
+                "Relay within 2 hops: {ok} of {} drones",
+                s.relay_ok.len()
+            ));
             if let Some(task) = self.selected_task.and_then(|k| s.tasks.get(k)) {
                 ui.add_space(4.0);
                 ui.label(
@@ -838,28 +868,45 @@ impl Viewer {
                         "uniform"
                     }
                 ));
-                let mut able: Vec<(f64, usize)> = self
-                    .swarm
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, d)| task.kind.can_do(d.role))
-                    .map(|(i, d)| (d.position.dist(task.position), i))
-                    .collect();
-                able.sort_by(|a, b| a.0.total_cmp(&b.0));
-                ui.weak("Closest drones that can take it:");
-                for &(dist, i) in able.iter().take(5) {
+                // Row of the cost matrix for this task, cheapest first (step 3c).
+                let k = self.selected_task.unwrap_or(0);
+                let mut order: Vec<usize> = (0..self.swarm.len()).collect();
+                order.sort_by(|&a, &b| s.costs.get(k, a).total_cmp(&s.costs.get(k, b)));
+                ui.weak("Cheapest drones (cost = km + β·(1 − battery) + penalty):");
+                for (rank, &i) in order.iter().take(5).enumerate() {
                     let d = &self.swarm[i];
+                    let cost = s.costs.get(k, i);
+                    let dist = d.position.dist(task.position);
+                    let tired = cfg.cost_beta * (1.0 - d.battery);
+                    let able = task.kind.able(d.role, s.relay_ok[i]);
+                    let why = if able {
+                        String::new()
+                    } else if !task.kind.can_do(d.role) {
+                        " + penalty (role)".to_string()
+                    } else {
+                        " + penalty (no relay)".to_string()
+                    };
                     let text = format!(
-                        "drone {} · {} · S{} · {dist:.2} km · battery {:.2}",
+                        "{}drone {} · {} · S{} · cost {cost:.2} = {dist:.2} km + {tired:.2}{why}",
+                        if rank == 0 { "BEST  " } else { "" },
                         d.id.0,
                         role_name(d.role),
                         d.squad.0,
-                        d.battery
                     );
+                    let mut text = RichText::new(text);
+                    if !able {
+                        text = text.color(RELAY_FAIL_COLOR);
+                    } else if rank == 0 {
+                        text = text.color(WINNER_COLOR).strong();
+                    }
                     if ui.selectable_label(false, text).clicked() {
                         self.selected = Some(i);
                     }
                 }
+                ui.weak(
+                    "BEST = cheapest drone, shown on the map with a gold star and a dashed \
+                     line from the task. It is the single-winner label (step 3d).",
+                );
                 if ui.button("Deselect task").clicked() {
                     self.selected_task = None;
                 }
@@ -915,6 +962,18 @@ impl Viewer {
                         "Weighted degree",
                         format!("{:.2}", mine.iter().map(|e| e.weight).sum::<f64>()),
                     );
+                    if let Some(s) = &self.snapshot {
+                        let ok = s.relay_ok.get(i) == Some(&true);
+                        row(
+                            "Relay ≤ 2 hops",
+                            if ok {
+                                "yes"
+                            } else {
+                                "no (can't Observe or Track)"
+                            }
+                            .to_string(),
+                        );
+                    }
                     row("Battery", format!("{:.2}", d.battery));
                     row("Sensor quality", format!("{:.2}", d.sensor_quality));
                     row("Compute capacity", format!("{:.2}", d.compute_capacity));
@@ -988,6 +1047,8 @@ fn build_snapshot(
     let labels = jammed_labels(&truth, cfg);
     let live = live_graph(graph, swarm, &truth, cfg);
     let tasks = spawn_tasks(swarm, cfg, rng);
+    let relay_ok = relay_within_two_hops(&live.graph, swarm);
+    let costs = cost_matrix(swarm, &tasks, &relay_ok, cfg);
     let field = jam_field(&jammer, &ridge, cfg);
     Some(Snapshot {
         jammer,
@@ -997,6 +1058,8 @@ fn build_snapshot(
         labels,
         live,
         tasks,
+        relay_ok,
+        costs,
         field,
     })
 }
@@ -1022,6 +1085,21 @@ mod tests {
         assert_eq!(s.tasks, tasks);
         assert_eq!(s.live, live_graph(&v.graph, &swarm, &truth, &cfg));
         assert_eq!(s.labels, jammed_labels(&truth, &cfg));
+        assert_eq!(s.relay_ok, relay_within_two_hops(&s.live.graph, &swarm));
+        assert_eq!(s.costs, cost_matrix(&swarm, &tasks, &s.relay_ok, &cfg));
+    }
+
+    #[test]
+    fn gold_star_goes_to_the_cheapest_able_drone() {
+        let v = Viewer::default();
+        let s = v.snapshot.as_ref().unwrap();
+        for (k, task) in s.tasks.iter().enumerate() {
+            let w = map::cheapest_drone(s, k).unwrap();
+            let row = s.costs.row(k);
+            assert!(row.iter().all(|&c| row[w] <= c), "task {k}");
+            assert!(task.kind.able(v.swarm[w].role, s.relay_ok[w]), "task {k}");
+        }
+        assert_eq!(map::cheapest_drone(s, s.tasks.len()), None);
     }
 
     #[test]

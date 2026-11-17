@@ -33,7 +33,9 @@ pub const GUIS: [Gui; 3] = [
 
 /// The workspace root, two levels above this crate (known at compile time).
 fn workspace_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
 }
 
 /// The command that builds (if needed) and runs `bin` in release mode, from the
@@ -72,16 +74,25 @@ mod tests {
 
     #[test]
     fn every_gui_in_the_menu_is_a_binary() {
-        let bin_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src").join("bin");
+        let bin_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("bin");
         for gui in &GUIS {
-            assert!(bin_dir.join(format!("{}.rs", gui.bin)).exists(), "{}", gui.bin);
+            assert!(
+                bin_dir.join(format!("{}.rs", gui.bin)).exists(),
+                "{}",
+                gui.bin
+            );
         }
     }
 
     #[test]
     fn cargo_command_runs_the_binary_from_the_workspace_root() {
         let cmd = cargo_command("jamming_playground");
-        let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
         assert_eq!(
             args,
             [
