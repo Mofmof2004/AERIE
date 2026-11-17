@@ -107,9 +107,15 @@ fn main() {
     );
     println!("relays jammed per seed: {:.2}", sum_relays / k);
     println!("links lost: {:.1} %", 100.0 * sum_lost / k);
-    println!("free drones stranded (outside the largest piece): {:.2}", sum_stranded / k);
+    println!(
+        "free drones stranded (outside the largest piece): {:.2}",
+        sum_stranded / k
+    );
     println!(
         "free drones split into 2+ pieces: {split_seeds} / {n_seeds} seeds (before jamming: {split_before})"
     );
-    println!("reading on the wrong side of the threshold: {:.2} drones per seed", sum_disagree / k);
+    println!(
+        "reading on the wrong side of the threshold: {:.2} drones per seed",
+        sum_disagree / k
+    );
 }
