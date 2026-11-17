@@ -19,7 +19,7 @@ AERIE/
 │   │       ├── config.rs   SimConfig: squads, arena, cells, radio ranges, k, jamming (P0, d0, ridge factor, threshold, noise)
 │   │       ├── drone.rs    DroneId, SquadId, Role, Vec2, Drone
 │   │       ├── spawn.rs    spawn_swarm: places the squads and drones
-│   │       ├── jamming.rs  Jammer, Ridge, jam_power (falloff, ridge shadow), place_jamming (D02)
+│   │       ├── jamming.rs  Jammer, Ridge, jam_power (falloff, ridge shadow), place_jamming (D02), true_power, readings, jammed_labels
 │   │       ├── graphs.rs   declares the graph modules below
 │   │       └── graphs/
 │   │           ├── epsilon/   epsilon_graph (D00 rule), textbook_epsilon_graph, tests
@@ -147,9 +147,27 @@ real `swarmsim::jamming::jam_power` at every pixel (0.2 km).
   The *min / max jammed share* sliders (`jam_frac_min`, `jam_frac_max`) and the physics
   sliders (*P0*, *d0*, *ridge factor*, *jammed threshold*) re-run the placement live as you
   drag them. The threshold is a fraction of P0, as in `place_jamming`.
+- **Readings (2c):** each drone's true power comes from `true_power`, its sensor reading from
+  `readings` (truth + Normal(0, noise_sd · P0)), its label from `jammed_labels`. The *noise sd* slider changes the noise live.
+  *Dataset draw* is the noise the dataset gets (the seed's RNG, continued after spawn and
+  `place_jamming`); *New draw* gives fresh noise for the same truth. Moving the jammer changes
+  the truth but not each drone's noise.
+  *Colour drones by*: role, true power, reading, or *label vs reading*:
+
+  | Colour | Label (truth) | Reading |
+  |---|---|---|
+  | red | jammed | above the threshold |
+  | orange | jammed | below the threshold (missed) |
+  | purple | not jammed | above the threshold (false alarm) |
+  | grey | not jammed | below the threshold |
+
+  The red ring is always the label. Turn the heatmap off to see the colours better.
+  Hover a drone for its truth, reading and noise.
 - **Right panel:** power against distance (open ground and behind the ridge), the value table,
-  the power at the cursor per jammer (clear or blocked), and the effect on the swarm before
-  and after jamming (links, mean degree, components, isolated drones).
+  the power at the cursor per jammer (clear or blocked), the effect on the swarm before
+  and after jamming (links, mean degree, components, isolated drones), and readings against
+  truth: counts per colour, the measured noise (mean, sd), and a scatter plot of truth (x)
+  against reading (y) for every drone. Hover a dot to ring that drone on the map.
 
 ## Adding things
 

@@ -4,6 +4,7 @@ use crate::config::SimConfig;
 use crate::drone::{Drone, Vec2};
 use rand::RngExt;
 use rand_chacha::ChaCha8Rng;
+use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 use std::f64::consts::PI;
 
@@ -119,6 +120,47 @@ pub fn place_jamming(swarm: &[Drone], config: &SimConfig, rng: &mut ChaCha8Rng) 
     panic!("no jamming placement after {MAX_ATTEMPTS} attempts");
 }
 
+/// The true jamming power at each drone, in swarm order (element `i` is drone `i`).
+///
+/// This is what the simulator knows. The drones only see noisy `readings` of it.
+/// Zone labels and link failure are computed from these values.
+pub fn true_power(swarm: &[Drone], jammer: &Jammer, ridge: &Ridge, config: &SimConfig) -> Vec<f64> {
+    let mut true_power: Vec<f64> = Vec::new();
+    for drone in swarm {
+        let drone_jam: f64 = jam_power(jammer, ridge, drone.position, config);
+        true_power.push(drone_jam);
+    }
+    true_power
+}
+
+/// What each drone's sensor measures: its true power plus Gaussian noise with
+/// mean 0 and standard deviation `noise_sd * jam_p0`, in the same order as `truth`.
+///
+/// Not clamped: a reading can be slightly negative. The model sees these values,
+/// never the truth.
+pub fn readings(truth: &[f64], config: &SimConfig, rng: &mut ChaCha8Rng) -> Vec<f64> {
+    let sd = config.noise_sd * config.jam_p0;
+    let normal = Normal::new(0.0, sd).unwrap();
+    let mut reading: Vec<f64> = Vec::new();
+    for power in truth {
+        let reading_with_noise = power + normal.sample(rng);
+        reading.push(reading_with_noise);
+    }
+    reading
+}
+
+pub fn jammed_labels(truth: &[f64], config: &SimConfig) -> Vec<bool> {
+    let mut zone_label = Vec::new();
+    for &power in truth {
+        if power >= config.jam_threshold * config.jam_p0 {
+            zone_label.push(true);
+        } else {
+            zone_label.push(false);
+        }
+    }
+
+    zone_label
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,5 +415,189 @@ mod tests {
             ..SimConfig::default()
         };
         placed(0, &cfg);
+    }
+
+    // ---------------------------------------------------- 2c: truth, readings, labels
+
+    /// `n` readings of the same true power, from a fixed seed.
+    fn many_readings(truth: f64, n: usize, cfg: &SimConfig, seed: u64) -> Vec<f64> {
+        let mut rng = ChaCha8Rng::seed_from_u64(seed);
+        readings(&vec![truth; n], cfg, &mut rng)
+    }
+
+    fn mean_and_sd(xs: &[f64]) -> (f64, f64) {
+        let n = xs.len() as f64;
+        let mean = xs.iter().sum::<f64>() / n;
+        let var = xs.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
+        (mean, var.sqrt())
+    }
+
+    #[test]
+    fn true_power_is_jam_power_at_each_drone_in_order() {
+        let cfg = SimConfig::default();
+        let (swarm, j, r) = placed(3, &cfg);
+        let truth = true_power(&swarm, &j, &r, &cfg);
+        assert_eq!(truth.len(), swarm.len());
+        for (i, d) in swarm.iter().enumerate() {
+            assert_eq!(truth[i], jam_power(&j, &r, d.position, &cfg));
+        }
+    }
+
+    #[test]
+    fn true_power_matches_the_hand_values() {
+        // Drones moved to the 2a test points: d0 in open ground and d0 behind the ridge.
+        let cfg = config();
+        let (j, r) = setup();
+        let mut rng = ChaCha8Rng::seed_from_u64(0);
+        let mut swarm = spawn_swarm(&cfg, &mut rng);
+        swarm.truncate(2);
+        swarm[0].position = p(0.0, 4.0);
+        swarm[1].position = p(4.0, 0.0);
+        let truth = true_power(&swarm, &j, &r, &cfg);
+        assert!(close(truth[0], 0.5));
+        assert!(close(truth[1], 0.05));
+    }
+
+    #[test]
+    fn empty_swarm_gives_empty_outputs() {
+        let cfg = SimConfig::default();
+        let (j, r) = setup();
+        let mut rng = ChaCha8Rng::seed_from_u64(0);
+        assert!(true_power(&[], &j, &r, &cfg).is_empty());
+        assert!(readings(&[], &cfg, &mut rng).is_empty());
+        assert!(jammed_labels(&[], &cfg).is_empty());
+    }
+
+    #[test]
+    fn readings_keep_length_and_order() {
+        let cfg = SimConfig::default();
+        let truth = [0.0, 0.2, 0.9, 0.45, 0.6];
+        let mut rng = ChaCha8Rng::seed_from_u64(1);
+        let reads = readings(&truth, &cfg, &mut rng);
+        assert_eq!(reads.len(), truth.len());
+        // Each reading stays within 5 sd of its own truth: the order is kept.
+        for (r, t) in reads.iter().zip(&truth) {
+            assert!((r - t).abs() < 5.0 * cfg.noise_sd);
+        }
+    }
+
+    #[test]
+    fn zero_noise_gives_the_truth_back() {
+        let cfg = SimConfig {
+            noise_sd: 0.0,
+            ..SimConfig::default()
+        };
+        let truth = [0.0, 0.3, 0.7];
+        let mut rng = ChaCha8Rng::seed_from_u64(2);
+        assert_eq!(readings(&truth, &cfg, &mut rng), truth.to_vec());
+    }
+
+    #[test]
+    fn prediction_2_noise_has_mean_zero_and_sd_noise_sd() {
+        // 10,000 readings of truth 0.3: mean 0.3 (standard error 0.001), sd 0.1.
+        let cfg = SimConfig::default();
+        let (mean, sd) = mean_and_sd(&many_readings(0.3, 10_000, &cfg, 7));
+        assert!((mean - 0.3).abs() < 0.005, "mean {mean}");
+        assert!((sd - 0.1).abs() < 0.005, "sd {sd}");
+    }
+
+    #[test]
+    fn noise_sd_scales_with_p0() {
+        // Noise sd = noise_sd * P0: doubling P0 doubles the noise.
+        let cfg = SimConfig {
+            jam_p0: 2.0,
+            ..SimConfig::default()
+        };
+        let (_, sd) = mean_and_sd(&many_readings(0.6, 10_000, &cfg, 8));
+        assert!((sd - 0.2).abs() < 0.01, "sd {sd}");
+    }
+
+    #[test]
+    fn prediction_1_truth_045_reads_above_05_about_31_percent() {
+        // 0.5 is half an sd above 0.45: P(Z > 0.5) = 0.309.
+        let cfg = SimConfig::default();
+        let reads = many_readings(0.45, 10_000, &cfg, 9);
+        let above = reads.iter().filter(|&&r| r >= 0.5).count() as f64 / 10_000.0;
+        assert!((above - 0.309).abs() < 0.02, "share above {above}");
+    }
+
+    #[test]
+    fn readings_are_not_clamped() {
+        // Truth 0: about half the readings are negative, and they are kept.
+        let cfg = SimConfig::default();
+        let reads = many_readings(0.0, 1_000, &cfg, 10);
+        let negative = reads.iter().filter(|&&r| r < 0.0).count();
+        assert!((400..=600).contains(&negative), "{negative} negative");
+    }
+
+    #[test]
+    fn readings_are_deterministic_per_seed() {
+        let cfg = SimConfig::default();
+        let truth = [0.1, 0.5, 0.9];
+        assert_eq!(
+            many_readings(0.4, 50, &cfg, 11),
+            many_readings(0.4, 50, &cfg, 11)
+        );
+        let mut a = ChaCha8Rng::seed_from_u64(11);
+        let mut b = ChaCha8Rng::seed_from_u64(12);
+        assert_ne!(
+            readings(&truth, &cfg, &mut a),
+            readings(&truth, &cfg, &mut b)
+        );
+    }
+
+    #[test]
+    fn labels_use_the_threshold_with_equality_jammed() {
+        let cfg = SimConfig::default(); // threshold 0.5 * P0 = 0.5
+        let truth = [0.0, 0.49, 0.5, 0.51, 1.0];
+        assert_eq!(
+            jammed_labels(&truth, &cfg),
+            vec![false, false, true, true, true]
+        );
+    }
+
+    #[test]
+    fn label_threshold_is_a_fraction_of_p0() {
+        let cfg = SimConfig {
+            jam_p0: 2.0,
+            ..SimConfig::default()
+        }; // threshold 0.5 * 2 = 1.0
+        assert_eq!(
+            jammed_labels(&[0.6, 0.99, 1.0], &cfg),
+            vec![false, false, true]
+        );
+    }
+
+    #[test]
+    fn prediction_3_label_and_reading_can_disagree_both_ways() {
+        let cfg = SimConfig::default();
+        let threshold = cfg.jam_threshold * cfg.jam_p0;
+        // Truth 0.55 is jammed, yet some readings fall below the threshold (missed).
+        assert!(jammed_labels(&[0.55], &cfg)[0]);
+        assert!(
+            many_readings(0.55, 1_000, &cfg, 13)
+                .iter()
+                .any(|&r| r < threshold)
+        );
+        // Truth 0.45 is not jammed, yet some readings land above it (false alarm).
+        assert!(!jammed_labels(&[0.45], &cfg)[0]);
+        assert!(
+            many_readings(0.45, 1_000, &cfg, 14)
+                .iter()
+                .any(|&r| r >= threshold)
+        );
+    }
+
+    #[test]
+    fn placed_share_matches_the_labels() {
+        // place_jamming's own count and jammed_labels(true_power) agree on every seed.
+        let cfg = SimConfig::default();
+        for seed in 0..20 {
+            let (swarm, j, r) = placed(seed, &cfg);
+            let labels = jammed_labels(&true_power(&swarm, &j, &r, &cfg), &cfg);
+            let share = labels.iter().filter(|&&l| l).count() as f64 / swarm.len() as f64;
+            assert_eq!(share, jammed_share(&swarm, &j, &r, &cfg));
+            assert!((cfg.jam_frac_min..=cfg.jam_frac_max).contains(&share));
+        }
     }
 }

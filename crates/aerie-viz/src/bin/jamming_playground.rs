@@ -9,6 +9,9 @@
 //! Optional swarm layer: which drones are jammed and which links fail (previews 2c / 2d).
 //! "Place from seed" runs `place_jamming` on the chosen seed's swarm, exactly as the
 //! dataset will: spawn the swarm, then place jammer and ridge with the same RNG.
+//! Readings (2c): each drone's true power comes from your `true_power`, its sensor
+//! reading from your `readings`, its label from your `jammed_labels`. Drones can be coloured by label against reading, and
+//! a scatter plot shows truth against reading for every drone.
 
 use aerie_graph::EdgeList;
 use eframe::egui::{
@@ -21,7 +24,9 @@ use swarmsim::config::SimConfig;
 use swarmsim::drone::{Drone, Vec2};
 use swarmsim::graphs::epsilon::epsilon_graph;
 use swarmsim::graphs::stats::stats;
-use swarmsim::jamming::{Jammer, Ridge, jam_power, place_jamming};
+use swarmsim::jamming::{
+    Jammer, Ridge, jam_power, jammed_labels, place_jamming, readings, true_power,
+};
 use swarmsim::spawn::spawn_swarm;
 
 use aerie_viz::style::{draw_drone, role_color, role_name};
@@ -69,6 +74,60 @@ enum Combine {
 enum Scale {
     Linear,
     Log,
+}
+
+/// How the swarm's drones are coloured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DroneColor {
+    Role,
+    Truth,
+    Reading,
+    Check,
+}
+
+/// A drone's label (from the truth) against what its reading says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Check {
+    /// Jammed, and the reading is above the threshold too.
+    Hit,
+    /// Jammed, but the reading is below the threshold.
+    Missed,
+    /// Not jammed, but the reading is above the threshold.
+    FalseAlarm,
+    /// Not jammed, and the reading is below the threshold too.
+    Clear,
+}
+
+impl Check {
+    const ALL: [Check; 4] = [Check::Hit, Check::Missed, Check::FalseAlarm, Check::Clear];
+
+    fn name(self) -> &'static str {
+        match self {
+            Check::Hit => "jammed, reading agrees",
+            Check::Missed => "jammed, reading below threshold",
+            Check::FalseAlarm => "not jammed, reading above threshold",
+            Check::Clear => "not jammed, reading agrees",
+        }
+    }
+
+    fn color(self) -> Color32 {
+        match self {
+            Check::Hit => Color32::from_rgb(255, 70, 70),
+            Check::Missed => Color32::from_rgb(255, 170, 0),
+            Check::FalseAlarm => Color32::from_rgb(220, 90, 255),
+            Check::Clear => Color32::from_rgb(160, 160, 160),
+        }
+    }
+}
+
+/// Sorts a drone by its label (truth at or above the threshold) and its reading.
+fn check(label: bool, reading: f64, threshold: f64) -> Check {
+    match (label, reading >= threshold) {
+        (true, true) => Check::Hit,
+        (true, false) => Check::Missed,
+        (false, true) => Check::FalseAlarm,
+        (false, false) => Check::Clear,
+    }
 }
 
 /// What the current drag is doing.
@@ -132,6 +191,17 @@ struct JamApp {
     /// Message from the last placement (success or failure).
     place_msg: Option<String>,
 
+    // Readings (2c).
+    /// The seed's RNG right after spawn_swarm (and after place_jamming when placed):
+    /// where the dataset's readings draw their noise from.
+    rng_after: ChaCha8Rng,
+    /// 0 = the dataset's noise; 1, 2, ... = other noise draws for the same truth.
+    noise_draw: u64,
+    drone_color: DroneColor,
+    show_heat: bool,
+    /// Drone under the cursor in the truth / reading plot (highlighted on the map).
+    plot_hover: Option<usize>,
+
     // Heatmap texture cache.
     heat: Option<TextureHandle>,
     heat_key: Option<HeatKey>,
@@ -167,6 +237,11 @@ impl Default for JamApp {
             auto_place: false,
             placed_for: None,
             place_msg: None,
+            rng_after: ChaCha8Rng::seed_from_u64(0),
+            noise_draw: 0,
+            drone_color: DroneColor::Check,
+            show_heat: true,
+            plot_hover: None,
             heat: None,
             heat_key: None,
         };
@@ -263,14 +338,42 @@ impl JamApp {
         self.swarm = spawn_swarm(&self.config, &mut rng);
         self.graph = epsilon_graph(&self.swarm, &self.config);
         self.swarm_seed = Some(self.seed);
+        self.rng_after = rng;
     }
 
-    /// Jammed flag per drone: true power at or above the threshold.
+    /// True power per drone. With exactly one jammer this is your `true_power`;
+    /// with several, the GUI combines them (sum or max), which `true_power` does not do.
+    fn truth(&self) -> Vec<f64> {
+        if let [jammer] = self.jammers.as_slice() {
+            true_power(&self.swarm, jammer, &self.ridge_or_none(), &self.config)
+        } else {
+            self.swarm
+                .iter()
+                .map(|d| self.total_power(d.position))
+                .collect()
+        }
+    }
+
+    /// Sensor readings from your `readings`. Draw 0 continues the seed's RNG after
+    /// spawn (and place_jamming), exactly as the dataset will; other draws use a fresh
+    /// RNG. The noise depends only on the RNG, so moving the jammer changes the truth
+    /// but not the noise on each drone.
+    fn sensor_readings(&self, truth: &[f64]) -> Vec<f64> {
+        let mut rng = if self.noise_draw == 0 {
+            self.rng_after.clone()
+        } else {
+            ChaCha8Rng::seed_from_u64(
+                self.seed
+                    .wrapping_mul(1_000_003)
+                    .wrapping_add(self.noise_draw),
+            )
+        };
+        readings(truth, &self.config, &mut rng)
+    }
+
+    /// Jammed flag per drone (the zone label), from your `jammed_labels`.
     fn jammed(&self) -> Vec<bool> {
-        self.swarm
-            .iter()
-            .map(|d| self.total_power(d.position) >= self.threshold())
-            .collect()
+        jammed_labels(&self.truth(), &self.config)
     }
 
     /// The comm graph after link failure: links with a jammed end are removed.
@@ -316,6 +419,7 @@ impl JamApp {
             place_jamming(&swarm, &config, &mut rng)
         }));
         std::panic::set_hook(previous_hook);
+        self.rng_after = rng;
         self.graph = epsilon_graph(&swarm, &self.config);
         self.swarm = swarm;
         self.swarm_seed = Some(self.seed);
@@ -586,6 +690,7 @@ impl JamApp {
             self.config.jam_threshold = d.jam_threshold;
             self.config.jam_frac_min = d.jam_frac_min;
             self.config.jam_frac_max = d.jam_frac_max;
+            self.config.noise_sd = d.noise_sd;
         }
         ui.separator();
 
@@ -704,6 +809,61 @@ impl JamApp {
         ui.weak("Jammed = power ≥ threshold. A link fails when either end is jammed.");
         ui.separator();
 
+        // Readings (2c).
+        ui.label(RichText::new("Readings (2c)").strong());
+        ui.add(egui::Slider::new(&mut self.config.noise_sd, 0.0..=0.5).text("noise sd (× P0)"));
+        ui.horizontal(|ui| {
+            ui.label("Noise draw:");
+            let name = if self.noise_draw == 0 {
+                "dataset".to_string()
+            } else {
+                format!("#{}", self.noise_draw)
+            };
+            ui.label(RichText::new(name).monospace());
+            if ui
+                .button("New draw")
+                .on_hover_text("Fresh noise on every drone, same truth.")
+                .clicked()
+            {
+                self.noise_draw += 1;
+            }
+            if ui
+                .add_enabled(self.noise_draw != 0, egui::Button::new("Dataset draw"))
+                .on_hover_text(
+                    "The noise the dataset gets: the seed's RNG, continued after \
+                     spawn_swarm and place_jamming.",
+                )
+                .clicked()
+            {
+                self.noise_draw = 0;
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Colour drones by:");
+            ui.selectable_value(&mut self.drone_color, DroneColor::Role, "role");
+            ui.selectable_value(&mut self.drone_color, DroneColor::Truth, "true power");
+            ui.selectable_value(&mut self.drone_color, DroneColor::Reading, "reading");
+            ui.selectable_value(&mut self.drone_color, DroneColor::Check, "label vs reading");
+        });
+        if self.drone_color == DroneColor::Check {
+            for c in Check::ALL {
+                ui.horizontal(|ui| {
+                    let (rect, _) = ui.allocate_exact_size(vec2(12.0, 12.0), Sense::hover());
+                    ui.painter().circle_filled(rect.center(), 5.0, c.color());
+                    ui.label(c.name());
+                });
+            }
+        }
+        ui.checkbox(
+            &mut self.show_heat,
+            "Heatmap (turn off to see drone colours)",
+        );
+        ui.weak(
+            "Reading = truth + Normal(0, noise sd). The label (red ring) comes from the \
+             truth; the model will only see the readings.",
+        );
+        ui.separator();
+
         // Legend.
         ui.label(RichText::new("Legend").strong());
         ui.horizontal(|ui| {
@@ -733,6 +893,7 @@ impl JamApp {
     // --------------------------------------------------------- right panel
 
     fn details(&mut self, ui: &mut egui::Ui) {
+        self.plot_hover = None;
         ui.label(RichText::new("Power against distance (as a fraction of P0)").strong());
         ui.label(RichText::new("P(d) = P0 / (1 + (d / d0)²)").monospace());
         falloff_plot(ui, &self.config);
@@ -859,6 +1020,50 @@ impl JamApp {
         ui.weak(
             "Every jammed drone loses all its links, so it becomes isolated. \
              The plan's 2b question: how many drones should a jammer hit (5 to 30 %?).",
+        );
+        ui.separator();
+
+        // Readings against truth.
+        ui.label(RichText::new("Readings against truth (2c)").strong());
+        let truth = self.truth();
+        let reads = self.sensor_readings(&truth);
+        let thr = self.threshold();
+        let sd = self.config.noise_sd * self.config.jam_p0;
+        ui.label(format!(
+            "noise sd = noise_sd × P0 = {sd:.3}   ·   draw: {}",
+            if self.noise_draw == 0 {
+                "dataset".to_string()
+            } else {
+                format!("#{}", self.noise_draw)
+            }
+        ));
+        let mut counts = [0usize; 4];
+        for (&t, &r) in truth.iter().zip(&reads) {
+            counts[check(t >= thr, r, thr) as usize] += 1;
+        }
+        egui::Grid::new("checks").striped(true).show(ui, |ui| {
+            for c in Check::ALL {
+                let (rect, _) = ui.allocate_exact_size(vec2(12.0, 12.0), Sense::hover());
+                ui.painter().circle_filled(rect.center(), 5.0, c.color());
+                ui.label(c.name());
+                ui.label(counts[c as usize].to_string());
+                ui.end_row();
+            }
+        });
+        let n = truth.len().max(1) as f64;
+        let noise: Vec<f64> = reads.iter().zip(&truth).map(|(r, t)| r - t).collect();
+        let mean = noise.iter().sum::<f64>() / n;
+        let spread = (noise.iter().map(|e| (e - mean).powi(2)).sum::<f64>() / n).sqrt();
+        ui.label(format!(
+            "Measured noise over {} drones: mean {mean:+.3}, sd {spread:.3}",
+            truth.len()
+        ));
+        self.plot_hover = truth_reading_plot(ui, &truth, &reads, thr, self.config.jam_p0);
+        ui.weak(
+            "Each dot is a drone. On the diagonal: no noise. Right of the vertical line: \
+             jammed (label, from the truth). Above the horizontal line: the reading says \
+             jammed. Top left: false alarms. Bottom right: missed. Hover a dot to find \
+             the drone on the map.",
         );
     }
 
@@ -1005,7 +1210,9 @@ impl JamApp {
         }
         let arena = t.arena_rect();
         painter.rect_filled(arena, 0.0, Color32::BLACK);
-        if let Some(tex) = &self.heat {
+        if self.show_heat
+            && let Some(tex) = &self.heat
+        {
             painter.image(
                 tex.id(),
                 arena,
@@ -1047,8 +1254,15 @@ impl JamApp {
         }
 
         // --- Swarm layer.
+        let truth = if self.show_swarm {
+            self.truth()
+        } else {
+            Vec::new()
+        };
+        let reads = self.sensor_readings(&truth);
+        let thr = self.threshold();
         if self.show_swarm {
-            let jammed = self.jammed();
+            let jammed = jammed_labels(&truth, &self.config);
             for e in &self.graph.edges {
                 let (s, d) = (e.src as usize, e.dst as usize);
                 let a = t.to_screen(self.swarm[s].position);
@@ -1069,22 +1283,31 @@ impl JamApp {
                 }
             }
             let radius = (4.5 * self.zoom.sqrt()).clamp(3.5, 10.0);
+            let p0 = self.config.jam_p0.max(1e-9);
+            let outline = match self.drone_color {
+                DroneColor::Role | DroneColor::Check => Stroke::new(1.0, Color32::BLACK),
+                DroneColor::Truth | DroneColor::Reading => {
+                    Stroke::new(1.0, Color32::from_white_alpha(180))
+                }
+            };
             for (i, d) in self.swarm.iter().enumerate() {
                 let c = t.to_screen(d.position);
-                draw_drone(
-                    &painter,
-                    c,
-                    radius,
-                    d.role,
-                    role_color(d.role),
-                    Stroke::new(1.0, Color32::BLACK),
-                );
+                let fill = match self.drone_color {
+                    DroneColor::Role => role_color(d.role),
+                    DroneColor::Truth => heat_color(self.scale_t(truth[i] / p0)),
+                    DroneColor::Reading => heat_color(self.scale_t(reads[i] / p0)),
+                    DroneColor::Check => check(jammed[i], reads[i], thr).color(),
+                };
+                draw_drone(&painter, c, radius, d.role, fill, outline);
                 if jammed[i] {
                     painter.circle_stroke(
                         c,
                         radius + 3.0,
                         Stroke::new(2.0, Color32::from_rgb(255, 70, 70)),
                     );
+                }
+                if self.plot_hover == Some(i) {
+                    painter.circle_stroke(c, radius + 8.0, Stroke::new(2.5, Color32::WHITE));
                 }
             }
         }
@@ -1195,7 +1418,9 @@ impl JamApp {
             && let Some(i) = self.drone_at(&t, p)
         {
             let d = &self.swarm[i];
-            let power = self.total_power(d.position);
+            let (power, reading) = (truth[i], reads[i]);
+            let label = power >= thr;
+            let verdict = check(label, reading, thr);
             response.on_hover_ui_at_pointer(|ui| {
                 ui.strong(format!(
                     "Drone {} · squad S{} · {}",
@@ -1203,12 +1428,20 @@ impl JamApp {
                     d.squad.0,
                     role_name(d.role)
                 ));
-                ui.label(format!("Jamming power {power:.3}"));
-                ui.label(if power >= self.threshold() {
-                    "Jammed: all its links fail"
+                ui.label(RichText::new(format!("True power {power:.3}")).monospace());
+                ui.label(
+                    RichText::new(format!(
+                        "Reading    {reading:.3}  (noise {:+.3})",
+                        reading - power
+                    ))
+                    .monospace(),
+                );
+                ui.label(if label {
+                    "Label: jammed, all its links fail"
                 } else {
-                    "Not jammed"
+                    "Label: not jammed"
                 });
+                ui.label(RichText::new(verdict.name()).color(verdict.color()));
             });
         }
     }
@@ -1385,6 +1618,141 @@ fn falloff_plot(ui: &mut egui::Ui, cfg: &SimConfig) {
         );
         painter.galley(pos, galley, text);
     }
+}
+
+/// Each drone as a dot: true power (x) against its reading (y), both as fractions of
+/// P0, with the diagonal (no noise) and the threshold on both axes. Returns the drone
+/// under the cursor.
+fn truth_reading_plot(
+    ui: &mut egui::Ui,
+    truth: &[f64],
+    reads: &[f64],
+    threshold: f64,
+    p0: f64,
+) -> Option<usize> {
+    let p0 = p0.max(1e-9);
+    let thr = threshold / p0;
+    let xs: Vec<f64> = truth.iter().map(|v| v / p0).collect();
+    let ys: Vec<f64> = reads.iter().map(|v| v / p0).collect();
+    let mut lo: f64 = 0.0;
+    let mut hi: f64 = (thr * 1.6).max(0.2);
+    for &v in xs.iter().chain(&ys) {
+        lo = lo.min(v);
+        hi = hi.max(v);
+    }
+    let pad = 0.05 * (hi - lo);
+    let (lo, hi) = (lo - pad, hi + pad);
+
+    let width = ui.available_width().max(200.0);
+    let side = (width - 50.0).min(300.0);
+    let (response, painter) = ui.allocate_painter(vec2(width, side + 40.0), Sense::hover());
+    let rect = response.rect;
+    let plot = Rect::from_min_size(rect.min + vec2(40.0, 8.0), vec2(side, side));
+    let sx = |v: f64| plot.left() + ((v - lo) / (hi - lo)) as f32 * plot.width();
+    let sy = |v: f64| plot.bottom() - ((v - lo) / (hi - lo)) as f32 * plot.height();
+    let visuals = ui.visuals();
+    let text = visuals.text_color();
+    let weak = visuals.weak_text_color();
+    let small = FontId::proportional(11.0);
+
+    painter.rect_filled(plot, 2.0, visuals.extreme_bg_color);
+    let step = if hi - lo > 2.0 { 0.5 } else { 0.25 };
+    let mut k = (lo / step).ceil() * step;
+    while k <= hi {
+        let grid = Stroke::new(1.0, weak.gamma_multiply(0.2));
+        painter.hline(plot.x_range(), sy(k), grid);
+        painter.vline(sx(k), plot.y_range(), grid);
+        painter.text(
+            pos2(plot.left() - 4.0, sy(k)),
+            Align2::RIGHT_CENTER,
+            format!("{k}"),
+            small.clone(),
+            weak,
+        );
+        painter.text(
+            pos2(sx(k), plot.bottom() + 3.0),
+            Align2::CENTER_TOP,
+            format!("{k}"),
+            small.clone(),
+            weak,
+        );
+        k += step;
+    }
+    painter.text(
+        pos2(plot.center().x, rect.bottom()),
+        Align2::CENTER_BOTTOM,
+        "x: true power   ·   y: reading   (× P0)",
+        small.clone(),
+        weak,
+    );
+
+    // Diagonal (reading = truth) and the threshold on both axes.
+    painter.line_segment(
+        [pos2(sx(lo), sy(lo)), pos2(sx(hi), sy(hi))],
+        Stroke::new(1.0, text.gamma_multiply(0.35)),
+    );
+    let dash = Stroke::new(1.0, text.gamma_multiply(0.8));
+    painter.extend(Shape::dashed_line(
+        &[pos2(sx(thr), plot.top()), pos2(sx(thr), plot.bottom())],
+        dash,
+        4.0,
+        3.0,
+    ));
+    painter.extend(Shape::dashed_line(
+        &[pos2(plot.left(), sy(thr)), pos2(plot.right(), sy(thr))],
+        dash,
+        4.0,
+        3.0,
+    ));
+    painter.text(
+        plot.left_top() + vec2(4.0, 3.0),
+        Align2::LEFT_TOP,
+        "false alarm",
+        small.clone(),
+        Check::FalseAlarm.color(),
+    );
+    painter.text(
+        plot.right_bottom() - vec2(4.0, 3.0),
+        Align2::RIGHT_BOTTOM,
+        "missed",
+        small.clone(),
+        Check::Missed.color(),
+    );
+
+    for (i, (&x, &y)) in xs.iter().zip(&ys).enumerate() {
+        let c = check(truth[i] >= threshold, reads[i], threshold);
+        painter.circle_filled(pos2(sx(x), sy(y)), 3.0, c.color());
+    }
+
+    let hovered = response.hover_pos().and_then(|p| {
+        xs.iter()
+            .zip(&ys)
+            .enumerate()
+            .map(|(i, (&x, &y))| (i, pos2(sx(x), sy(y)).distance(p)))
+            .filter(|&(_, d)| d <= 6.0)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(i, _)| i)
+    });
+    if let Some(i) = hovered {
+        let c = pos2(sx(xs[i]), sy(ys[i]));
+        painter.circle_stroke(c, 6.0, Stroke::new(1.5, text));
+        let label = format!(
+            "drone {i}\ntruth   {:.3}\nreading {:.3}",
+            truth[i], reads[i]
+        );
+        let galley = painter.layout_no_wrap(label, FontId::monospace(11.0), text);
+        let mut pos = c + vec2(8.0, 8.0);
+        if pos.x + galley.size().x > rect.right() {
+            pos.x = c.x - 8.0 - galley.size().x;
+        }
+        painter.rect_filled(
+            Rect::from_min_size(pos, galley.size()).expand(3.0),
+            3.0,
+            visuals.window_fill,
+        );
+        painter.galley(pos, galley, text);
+    }
+    hovered
 }
 
 /// A jammer marker: a red disc with four short rays.
@@ -1634,6 +2002,73 @@ mod tests {
         assert_eq!(a.jammed(), b.jammed());
         assert_eq!(a.ridge, b.ridge);
         assert_eq!(a.jammers[0].position, b.jammers[0].position);
+    }
+
+    #[test]
+    fn readings_follow_the_dataset_order() {
+        let mut app = JamApp {
+            seed: 4,
+            ..Default::default()
+        };
+        app.place_from_seed();
+        // The dataset: spawn, place, truth, readings, all with one RNG.
+        let cfg = SimConfig::default();
+        let mut rng = ChaCha8Rng::seed_from_u64(4);
+        let swarm = spawn_swarm(&cfg, &mut rng);
+        let (jammer, ridge) = place_jamming(&swarm, &cfg, &mut rng);
+        let truth = true_power(&swarm, &jammer, &ridge, &cfg);
+        let reads = readings(&truth, &cfg, &mut rng);
+        assert_eq!(app.truth(), truth);
+        assert_eq!(app.sensor_readings(&app.truth()), reads);
+    }
+
+    /// Reading minus truth, per drone.
+    fn noise(app: &JamApp) -> Vec<f64> {
+        let truth = app.truth();
+        app.sensor_readings(&truth)
+            .iter()
+            .zip(&truth)
+            .map(|(r, t)| r - t)
+            .collect()
+    }
+
+    #[test]
+    fn moving_the_jammer_changes_the_truth_not_the_noise() {
+        let mut app = JamApp {
+            seed: 4,
+            ..Default::default()
+        };
+        app.place_from_seed();
+        let truth_before = app.truth();
+        let noise_before = noise(&app);
+        app.jammers[0].position.x += 3.0;
+        assert_ne!(app.truth(), truth_before);
+        for (a, b) in noise(&app).iter().zip(&noise_before) {
+            assert!((a - b).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn a_new_draw_changes_the_noise() {
+        let mut app = JamApp {
+            seed: 4,
+            ..Default::default()
+        };
+        app.place_from_seed();
+        let dataset = noise(&app);
+        app.noise_draw = 1;
+        assert_ne!(noise(&app), dataset);
+        app.noise_draw = 0;
+        assert_eq!(noise(&app), dataset);
+    }
+
+    #[test]
+    fn check_sorts_label_against_reading() {
+        assert_eq!(check(true, 0.6, 0.5), Check::Hit);
+        assert_eq!(check(true, 0.4, 0.5), Check::Missed);
+        assert_eq!(check(false, 0.6, 0.5), Check::FalseAlarm);
+        assert_eq!(check(false, 0.4, 0.5), Check::Clear);
+        assert_eq!(check(false, 0.5, 0.5), Check::FalseAlarm); // >= like the label
     }
 
     #[test]
