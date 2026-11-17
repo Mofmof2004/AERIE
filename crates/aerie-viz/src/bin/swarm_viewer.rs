@@ -18,13 +18,16 @@ use swarmsim::graphs::stats::stats;
 use swarmsim::jamming::{jammed_labels, place_jamming, readings, true_power};
 use swarmsim::links::live_graph;
 use swarmsim::spawn::spawn_swarm;
-use swarmsim::tasks::{TaskKind, cost_matrix, relay_within_two_hops, spawn_tasks};
+use swarmsim::tasks::{
+    TaskKind, assignment_cost, cost_matrix, joint_winners, relay_within_two_hops, single_winners,
+    spawn_tasks,
+};
 
 use aerie_viz::launch::{GUIS, launch};
 use aerie_viz::map::{
-    self, ColorBy, JAMMED_DRONE_COLOR, Layers, LinkColor, LinkSource, MapView, RELAY_FAIL_COLOR,
-    RangeCircles, Snapshot, WINNER_COLOR, jam_field, n_near_tasks, task_color, task_letter,
-    task_name,
+    self, ColorBy, JAMMED_DRONE_COLOR, JOINT_COLOR, Layers, LinkColor, LinkSource, MapView,
+    RELAY_FAIL_COLOR, RangeCircles, Snapshot, WINNER_COLOR, jam_field, n_near_tasks, task_color,
+    task_letter, task_name,
 };
 use aerie_viz::mission::Mission;
 use aerie_viz::squads::{SquadInfo, cell_count, cell_options, squad_infos};
@@ -847,6 +850,24 @@ impl Viewer {
                 "Relay within 2 hops: {ok} of {} drones",
                 s.relay_ok.len()
             ));
+            // The two oracle labels over all tasks (step 3d).
+            let open = s.joint.iter().filter(|w| w.is_none()).count();
+            let differ = (0..s.tasks.len())
+                .filter(|&k| s.joint[k].is_some() && s.joint[k] != Some(s.single[k]))
+                .count();
+            // Over the staffed tasks only, so both totals cover the same tasks.
+            let singles: f64 = (0..s.tasks.len())
+                .filter(|&k| s.joint[k].is_some())
+                .map(|k| s.costs.get(k, s.single[k]))
+                .sum();
+            ui.label(format!(
+                "Oracle: joint differs from single on {differ} of {} tasks, {open} open",
+                s.tasks.len()
+            ));
+            ui.weak(format!(
+                "Total cost: singles {singles:.1} km (may share drones), joint {:.1} km",
+                assignment_cost(&s.costs, &s.joint)
+            ));
             if let Some(task) = self.selected_task.and_then(|k| s.tasks.get(k)) {
                 ui.add_space(4.0);
                 ui.label(
@@ -872,7 +893,9 @@ impl Viewer {
                 let k = self.selected_task.unwrap_or(0);
                 let mut order: Vec<usize> = (0..self.swarm.len()).collect();
                 order.sort_by(|&a, &b| s.costs.get(k, a).total_cmp(&s.costs.get(k, b)));
-                ui.weak("Cheapest drones (cost = km + β·(1 − battery) + penalty):");
+                ui.weak(
+                    "Cheapest drones (cost = km + β·(1 − battery), or the penalty if not able):",
+                );
                 for (rank, &i) in order.iter().take(5).enumerate() {
                     let d = &self.swarm[i];
                     let cost = s.costs.get(k, i);
@@ -880,14 +903,14 @@ impl Viewer {
                     let tired = cfg.cost_beta * (1.0 - d.battery);
                     let able = task.kind.able(d.role, s.relay_ok[i]);
                     let why = if able {
-                        String::new()
+                        format!("{dist:.2} km + {tired:.2}")
                     } else if !task.kind.can_do(d.role) {
-                        " + penalty (role)".to_string()
+                        "penalty (role)".to_string()
                     } else {
-                        " + penalty (no relay)".to_string()
+                        "penalty (no relay)".to_string()
                     };
                     let text = format!(
-                        "{}drone {} · {} · S{} · cost {cost:.2} = {dist:.2} km + {tired:.2}{why}",
+                        "{}drone {} · {} · S{} · cost {cost:.2} = {why}",
                         if rank == 0 { "BEST  " } else { "" },
                         d.id.0,
                         role_name(d.role),
@@ -907,6 +930,47 @@ impl Viewer {
                     "BEST = cheapest drone, shown on the map with a gold star and a dashed \
                      line from the task. It is the single-winner label (step 3d).",
                 );
+                ui.add_space(2.0);
+                let single = s.single[k];
+                ui.label(
+                    RichText::new(format!(
+                        "Single winner: drone {} · cost {:.2}",
+                        self.swarm[single].id.0,
+                        s.costs.get(k, single)
+                    ))
+                    .color(WINNER_COLOR),
+                );
+                match s.joint[k] {
+                    Some(j) if j == single => {
+                        ui.label(RichText::new("Joint winner: the same drone").color(JOINT_COLOR));
+                    }
+                    Some(j) => {
+                        let other =
+                            (0..s.tasks.len()).find(|&t| t != k && s.joint[t] == Some(single));
+                        ui.label(
+                            RichText::new(format!(
+                                "Joint winner: drone {} · cost {:.2} (cyan star)",
+                                self.swarm[j].id.0,
+                                s.costs.get(k, j)
+                            ))
+                            .color(JOINT_COLOR),
+                        );
+                        if let Some(o) = other {
+                            ui.weak(format!(
+                                "Drone {} went to task {} instead.",
+                                self.swarm[single].id.0, s.tasks[o].id.0
+                            ));
+                        }
+                    }
+                    None => {
+                        ui.label(
+                            RichText::new(
+                                "Joint winner: none, the task stays open (no able drone left)",
+                            )
+                            .color(JOINT_COLOR),
+                        );
+                    }
+                }
                 if ui.button("Deselect task").clicked() {
                     self.selected_task = None;
                 }
@@ -1049,6 +1113,8 @@ fn build_snapshot(
     let tasks = spawn_tasks(swarm, cfg, rng);
     let relay_ok = relay_within_two_hops(&live.graph, swarm);
     let costs = cost_matrix(swarm, &tasks, &relay_ok, cfg);
+    let single = single_winners(&costs);
+    let joint = joint_winners(&costs, cfg);
     let field = jam_field(&jammer, &ridge, cfg);
     Some(Snapshot {
         jammer,
@@ -1060,6 +1126,8 @@ fn build_snapshot(
         tasks,
         relay_ok,
         costs,
+        single,
+        joint,
         field,
     })
 }
@@ -1087,6 +1155,8 @@ mod tests {
         assert_eq!(s.labels, jammed_labels(&truth, &cfg));
         assert_eq!(s.relay_ok, relay_within_two_hops(&s.live.graph, &swarm));
         assert_eq!(s.costs, cost_matrix(&swarm, &tasks, &s.relay_ok, &cfg));
+        assert_eq!(s.single, single_winners(&s.costs));
+        assert_eq!(s.joint, joint_winners(&s.costs, &cfg));
     }
 
     #[test]

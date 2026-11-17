@@ -130,6 +130,10 @@ pub struct Snapshot {
     pub relay_ok: Vec<bool>,
     /// Step 3c: cost of every drone for every task (rows tasks, columns drones).
     pub costs: CostMatrix,
+    /// Step 3d: cheapest drone per task, looking at the task alone.
+    pub single: Vec<usize>,
+    /// Step 3d: the Hungarian assignment, each drone on at most one task.
+    pub joint: Vec<Option<usize>>,
     /// Jamming power on a grid of FIELD_RES km cells (row 0 at y = 0), for the shading.
     pub field: Vec<f64>,
 }
@@ -201,6 +205,8 @@ const RIDGE_COLOR: Color32 = Color32::from_rgb(170, 120, 70);
 const ZONE_COLOR: Color32 = Color32::from_rgb(255, 70, 70);
 /// Star on the cheapest drone for the selected task (the single winner, step 3c/3d).
 pub const WINNER_COLOR: Color32 = Color32::from_rgb(255, 200, 40);
+/// Star and line to the joint winner (Hungarian, step 3d) when it differs from the single.
+pub const JOINT_COLOR: Color32 = Color32::from_rgb(70, 220, 255);
 /// Cross on drones whose role fits the selected task but that fail the relay rule.
 pub const RELAY_FAIL_COLOR: Color32 = Color32::from_rgb(255, 70, 70);
 /// Drones in the jammed zone: lime, used by no squad, role or task kind.
@@ -638,23 +644,31 @@ pub fn draw(
         }
     }
 
-    // The cheapest drone for the selected task: a gold dashed line from the task and a
-    // gold star on the drone. This is the single-winner label of step 3d.
+    // The two oracle labels for the selected task (step 3d): a gold dashed line and star
+    // on the single winner (cheapest drone for this task alone), and a cyan one on the
+    // joint winner (Hungarian) when it is a different drone.
     if layers.tasks
         && let Some(s) = snap
         && let Some(k) = *selected_task
         && let Some(task) = s.tasks.get(k)
-        && let Some(w) = cheapest_drone(s, k)
     {
         let from = t.to_screen(task.position.x, task.position.y);
-        let to = t.to_screen(swarm[w].position.x, swarm[w].position.y);
-        painter.extend(Shape::dashed_line(
-            &[from, to],
-            Stroke::new(2.0, WINNER_COLOR),
-            6.0,
-            4.0,
-        ));
-        draw_star(&painter, to + vec2(0.0, -radius - 9.0), 8.0, WINNER_COLOR);
+        let single = cheapest_drone(s, k);
+        let joint = s.joint.get(k).copied().flatten();
+        for (w, color) in [(joint, JOINT_COLOR), (single, WINNER_COLOR)] {
+            let Some(w) = w else { continue };
+            if color == JOINT_COLOR && joint == single {
+                continue; // same drone: the gold star says both
+            }
+            let to = t.to_screen(swarm[w].position.x, swarm[w].position.y);
+            painter.extend(Shape::dashed_line(
+                &[from, to],
+                Stroke::new(2.0, color),
+                6.0,
+                4.0,
+            ));
+            draw_star(&painter, to + vec2(0.0, -radius - 9.0), 8.0, color);
+        }
     }
 
     // Selection ring.
@@ -823,16 +837,9 @@ fn draw_jammer(painter: &Painter, c: Pos2) {
 
 /// Points on a circle, closed.
 /// Index of the drone with the lowest cost for task `k` (row `k` of the cost matrix).
+/// It is the single-winner label (`single_winners`).
 pub fn cheapest_drone(snap: &Snapshot, k: usize) -> Option<usize> {
-    if k >= snap.costs.n_tasks {
-        return None;
-    }
-    snap.costs
-        .row(k)
-        .iter()
-        .enumerate()
-        .min_by(|a, b| a.1.total_cmp(b.1))
-        .map(|(i, _)| i)
+    snap.single.get(k).copied()
 }
 
 /// A filled five-pointed star centred on `c`, outer radius `r`, with a dark outline.

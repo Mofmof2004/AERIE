@@ -79,7 +79,7 @@ pub struct SimConfig {
     /// Cost of an empty battery, in km of travel (step 3c): the cost adds
     /// `cost_beta * (1 - battery)`. Batteries spawn in 0.5..1, so it adds 0 to 1.5 km.
     pub cost_beta: f64,
-    /// Cost added when a drone cannot take a task (role does not fit, or no relay within
+    /// Cost of a drone that cannot take a task (flat, instead of distance + battery) (role does not fit, or no relay within
     /// 2 hops for Observe and Track). Larger than any real cost, but finite so the
     /// Hungarian solver (step 3d) still has a number in every cell.
     pub cost_penalty: f64,

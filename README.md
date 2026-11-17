@@ -21,7 +21,7 @@ AERIE/
 │   │       ├── spawn.rs    spawn_swarm: places the squads and drones
 │   │       ├── jamming.rs  Jammer, Ridge, jam_power (falloff, ridge shadow), place_jamming (D02), true_power, readings, jammed_labels, fail_links
 │   │       ├── links.rs    the link model (D03): margin, LiveGraph, live_graph
-│   │       ├── tasks.rs    TaskId, TaskKind (can_do, needs_relay, able), Task, spawn_tasks, relay_within_two_hops, CostMatrix, cost_matrix
+│   │       ├── tasks.rs    TaskId, TaskKind (can_do, needs_relay, able), Task, spawn_tasks, relay_within_two_hops, CostMatrix, cost_matrix, single_winners, joint_winners, assignment_cost
 │   │       ├── graphs.rs   declares the graph modules below
 │   │       └── graphs/
 │   │           ├── epsilon/   epsilon_graph (D00 rule), textbook_epsilon_graph, tests
@@ -99,9 +99,14 @@ is built in the dataset order with one RNG: `spawn_swarm`, `place_jamming`, `tru
   (role and relay rule), the hover says how many are cut off, and the selected drone shows
   *Relay ≤ 2 hops*. On seeds 0–99 about 97 % of drones pass.
 - **Costs (step 3c):** the selected task lists its 5 cheapest drones from the cost matrix,
-  with the cost split into km + battery term (+ penalty when not able). The cheapest (BEST)
-  gets a **gold star** on the map and a gold dashed line from the task: the future
-  single-winner label. β and the penalty are in *Settings → Tasks and costs*.
+  with the cost split into km + battery term (a flat penalty instead when not able). The cheapest (BEST)
+  gets a **gold star** on the map and a gold dashed line from the task: the single-winner label.
+- **Oracle labels (step 3d):** *single winner* = cheapest drone for the task alone (gold);
+  *joint winner* = the Hungarian assignment over all tasks, each drone on at most one task
+  (a **cyan star** and line when it is a different drone). The panel says which task took the
+  single winner, and counts the tasks where the two labels differ. A task stays **open** when
+  no able drone is left for it (about 1 seed in 10 has more Fuse tasks than the 15 compute
+  drones). β and the penalty are in *Settings → Tasks and costs*.
 
 - **Left panel:** mission, seed (◀ ▶ to step), cell size, squad count and size, spread, radio ranges, layers, legend.
 - **Menu bar:** *Playgrounds* opens any GUI (graph playground, jamming playground, another swarm

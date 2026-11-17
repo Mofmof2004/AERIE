@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 aerie-graph = { path = "../aerie-graph" }
+pathfinding = { workspace = true }
 rand = {workspace= true}
 rand_chacha = { workspace = true }
 rand_distr = { workspace = true }

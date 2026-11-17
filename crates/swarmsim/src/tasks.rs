@@ -5,6 +5,8 @@
 use crate::config::SimConfig;
 use crate::drone::{Drone, Role, Vec2};
 use aerie_graph::EdgeList;
+use pathfinding::kuhn_munkres::kuhn_munkres_min;
+use pathfinding::matrix::Matrix;
 use rand::RngExt;
 use rand_chacha::ChaCha8Rng;
 use serde::{Deserialize, Serialize};
@@ -222,12 +224,16 @@ impl CostMatrix {
 
 /// The cost of drone i taking task j:
 ///
-/// `c_ij = distance_ij + cost_beta * (1 - battery_i) + penalty_ij`
+/// `c_ij = distance_ij + cost_beta * (1 - battery_i)` when the drone is `able`,
+/// `c_ij = cost_penalty` when it is not (wrong role, or no relay within 2 hops for
+/// Observe and Track).
 ///
 /// - distance in km stands for travel time (one speed for every drone);
 /// - the battery term makes a tired drone look further away (up to 1.5 km by default);
-/// - the penalty (`cost_penalty`) is added when the drone is not `able` to take the task:
-///   wrong role, or no relay within 2 hops for Observe and Track.
+/// - the penalty is flat, not added on top of the distance: a drone that cannot do the
+///   task should not count as "closer" or "further". Otherwise, when a kind has more
+///   tasks than able drones, the distance of the drone that cannot do it would decide
+///   which task stays open.
 ///
 /// `relay_ok` is `relay_within_two_hops` on the live graph, one entry per drone.
 pub fn cost_matrix(
@@ -240,14 +246,14 @@ pub fn cost_matrix(
     let mut data = Vec::with_capacity(tasks.len() * swarm.len());
     for task in tasks {
         for (i, drone) in swarm.iter().enumerate() {
-            let travel = drone.position.dist(task.position);
-            let tired = config.cost_beta * (1.0 - drone.battery);
-            let penalty = if task.kind.able(drone.role, relay_ok[i]) {
-                0.0
+            let cost = if task.kind.able(drone.role, relay_ok[i]) {
+                let travel = drone.position.dist(task.position);
+                let tired = config.cost_beta * (1.0 - drone.battery);
+                travel + tired
             } else {
                 config.cost_penalty
             };
-            data.push(travel + tired + penalty);
+            data.push(cost);
         }
     }
     CostMatrix {
@@ -255,6 +261,96 @@ pub fn cost_matrix(
         n_drones: swarm.len(),
         data,
     }
+}
+
+/// Integer cost units per km for the Hungarian solver: 1 unit = 1 m. The solver needs
+/// `Ord`, and `f64` is not `Ord` (NaN), so costs are rounded to whole metres.
+pub const COST_SCALE: f64 = 1000.0;
+
+/// Oracle label 1 (step 3d): for each task, the drone with the lowest cost, looking at
+/// that task alone. Two tasks can pick the same drone. Mission 5 trains the bids on it.
+///
+/// Returns one drone index per task. Panics if there are tasks but no drones. If no drone
+/// is able, the winner is a penalised drone (cost at least `cost_penalty`); on seeds 0-99
+/// every task has an able drone.
+pub fn single_winners(costs: &CostMatrix) -> Vec<usize> {
+    assert!(
+        costs.n_drones > 0 || costs.n_tasks == 0,
+        "tasks but no drones to pick from"
+    );
+    let mut winners = Vec::with_capacity(costs.n_tasks);
+    for task in 0..costs.n_tasks {
+        // Any real cost is below infinity, so the first drone always replaces it.
+        let mut best_i = 0;
+        let mut best_cost = f64::INFINITY;
+        for (i, &cost) in costs.row(task).iter().enumerate() {
+            if cost < best_cost {
+                best_cost = cost;
+                best_i = i;
+            }
+        }
+        winners.push(best_i);
+    }
+    winners
+}
+
+/// Oracle label 2 (step 3d): all tasks assigned at once, each drone to at most one task,
+/// with the lowest total cost (the Hungarian algorithm, `kuhn_munkres_min`). Mission 5
+/// measures regret against it.
+///
+/// One entry per task: `Some(drone)`, or `None` when the task stays open:
+/// - not enough able drones for it (e.g. 18 Fuse tasks and 15 compute drones, about 1 seed
+///   in 10): the solver would give it a drone that pays `cost_penalty`, so it is dropped;
+/// - more tasks than drones: every drone gets a task, the rest stay open.
+///
+/// With the penalty far above any real cost, the solver first keeps the number of
+/// penalised tasks as low as possible, then the total cost, so dropping them leaves the
+/// cheapest assignment that staffs as many tasks as possible.
+pub fn joint_winners(costs: &CostMatrix, config: &SimConfig) -> Vec<Option<usize>> {
+    let (n_tasks, n_drones) = (costs.n_tasks, costs.n_drones);
+    let mut winners = vec![None; n_tasks];
+    if n_tasks == 0 || n_drones == 0 {
+        return winners;
+    }
+    // km -> whole metres.
+    let units = |cost: f64| (cost * COST_SCALE).round() as i64;
+    if n_tasks <= n_drones {
+        // The solver needs rows <= columns: tasks on rows, drones on columns.
+        let m = Matrix::from_fn(n_tasks, n_drones, |(task, drone)| {
+            units(costs.get(task, drone))
+        });
+        let (_total, drone_of_task) = kuhn_munkres_min(&m);
+        for (task, drone) in drone_of_task.into_iter().enumerate() {
+            winners[task] = Some(drone);
+        }
+    } else {
+        // More tasks than drones: flip it, so every drone gets its best share of tasks.
+        let m = Matrix::from_fn(n_drones, n_tasks, |(drone, task)| {
+            units(costs.get(task, drone))
+        });
+        let (_total, task_of_drone) = kuhn_munkres_min(&m);
+        for (drone, task) in task_of_drone.into_iter().enumerate() {
+            winners[task] = Some(drone);
+        }
+    }
+    // A drone that pays the penalty cannot really do the task: leave the task open.
+    for (task, w) in winners.iter_mut().enumerate() {
+        if w.is_some_and(|drone| costs.get(task, drone) >= config.cost_penalty) {
+            *w = None;
+        }
+    }
+    winners
+}
+
+/// Total cost of an assignment (one optional drone per task), in km. Tasks with no drone
+/// add nothing. Mission 5's regret is
+/// `(assignment_cost(swarm's pick) - assignment_cost(joint)) / assignment_cost(joint)`.
+pub fn assignment_cost(costs: &CostMatrix, winners: &[Option<usize>]) -> f64 {
+    winners
+        .iter()
+        .enumerate()
+        .filter_map(|(task, w)| w.map(|drone| costs.get(task, drone)))
+        .sum()
 }
 
 #[cfg(test)]
@@ -652,6 +748,185 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A cost matrix from rows of numbers.
+    fn matrix(rows: &[&[f64]]) -> CostMatrix {
+        CostMatrix {
+            n_tasks: rows.len(),
+            n_drones: rows.first().map_or(0, |r| r.len()),
+            data: rows.iter().flat_map(|r| r.iter().copied()).collect(),
+        }
+    }
+
+    /// The cheapest assignment by trying every one: each task gets a different drone.
+    /// Only for tiny matrices (n_drones! / (n_drones - n_tasks)! orders).
+    fn brute_force_best(costs: &CostMatrix) -> f64 {
+        fn go(costs: &CostMatrix, task: usize, used: &mut Vec<bool>) -> f64 {
+            if task == costs.n_tasks {
+                return 0.0;
+            }
+            let mut best = f64::INFINITY;
+            for d in 0..costs.n_drones {
+                if !used[d] {
+                    used[d] = true;
+                    best = best.min(costs.get(task, d) + go(costs, task + 1, used));
+                    used[d] = false;
+                }
+            }
+            best
+        }
+        go(costs, 0, &mut vec![false; costs.n_drones])
+    }
+
+    #[test]
+    fn single_winner_is_the_row_minimum() {
+        let c = matrix(&[&[4.0, 1.0, 3.0], &[2.0, 5.0, 0.5]]);
+        assert_eq!(single_winners(&c), [1, 2]);
+    }
+
+    #[test]
+    fn single_winners_can_collide_joint_winners_cannot() {
+        let cfg = SimConfig::default();
+        // Drone 0 is the cheapest for both tasks. Alone, both pick it. Together, task 1
+        // keeps it (it would cost 10 otherwise) and task 0 moves to drone 1:
+        // 2 + 1 = 3 instead of 1 + 10 = 11.
+        let c = matrix(&[&[1.0, 2.0], &[1.0, 10.0]]);
+        assert_eq!(single_winners(&c), [0, 0]);
+        assert_eq!(joint_winners(&c, &cfg), [Some(1), Some(0)]);
+        assert_eq!(assignment_cost(&c, &joint_winners(&c, &cfg)), 3.0);
+    }
+
+    #[test]
+    fn joint_matches_brute_force_on_small_matrices() {
+        let cfg = SimConfig::default();
+        // Whole-number costs, so rounding to metres changes nothing.
+        let mut rng = ChaCha8Rng::seed_from_u64(1);
+        for _ in 0..200 {
+            let rows: Vec<Vec<f64>> = (0..3)
+                .map(|_| (0..5).map(|_| rng.random_range(0..20) as f64).collect())
+                .collect();
+            let refs: Vec<&[f64]> = rows.iter().map(|r| r.as_slice()).collect();
+            let c = matrix(&refs);
+            let joint = joint_winners(&c, &cfg);
+            assert_eq!(
+                assignment_cost(&c, &joint),
+                brute_force_best(&c),
+                "{rows:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn more_tasks_than_drones_leaves_the_rest_unassigned() {
+        let cfg = SimConfig::default();
+        // 3 tasks, 2 drones: both drones get a task, the costliest leftover gets None.
+        let c = matrix(&[&[1.0, 9.0], &[9.0, 1.0], &[5.0, 5.0]]);
+        assert_eq!(joint_winners(&c, &cfg), [Some(0), Some(1), None]);
+        // No tasks, or no drones: nothing to assign.
+        assert!(joint_winners(&matrix(&[]), &cfg).is_empty());
+        assert!(single_winners(&matrix(&[])).is_empty());
+        let no_drones = CostMatrix {
+            n_tasks: 2,
+            n_drones: 0,
+            data: vec![],
+        };
+        assert_eq!(joint_winners(&no_drones, &cfg), [None, None]);
+    }
+
+    #[test]
+    fn a_task_with_no_able_drone_left_stays_open() {
+        // Two Fuse tasks, one compute drone (drone 1, at x = 3) and one recon drone
+        // (drone 0). Both tasks want drone 1. It goes where it is cheaper: task 1 at
+        // x = 4 (1 km), not task 0 at x = 0 (3 km). Task 0 stays open instead of going
+        // to the recon drone with the penalty.
+        let cfg = SimConfig::default();
+        let mut swarm = row(2, &[]);
+        swarm[1].role = Role::Compute;
+        swarm[1].position = Vec2 { x: 3.0, y: 0.0 };
+        let tasks = [task_at(TaskKind::Fuse, 0.0), task_at(TaskKind::Fuse, 4.0)];
+        let c = cost_matrix(&swarm, &tasks, &[true; 2], &cfg);
+        assert_eq!(single_winners(&c), [1, 1]);
+        assert_eq!(joint_winners(&c, &cfg), [None, Some(1)]);
+    }
+
+    #[test]
+    fn real_seeds_oracle_invariants() {
+        let cfg = SimConfig::default();
+        for seed in 0..10 {
+            let (swarm, live) = live_snapshot(seed, &cfg);
+            let tasks = spawn_tasks(&swarm, &cfg, &mut ChaCha8Rng::seed_from_u64(seed));
+            let ok = relay_within_two_hops(&live, &swarm);
+            let c = cost_matrix(&swarm, &tasks, &ok, &cfg);
+            let single = single_winners(&c);
+            let joint = joint_winners(&c, &cfg);
+            // Open tasks only when a kind has more tasks than able drones (seed 3: 16
+            // Fuse tasks for 15 compute drones).
+            let open = joint.iter().filter(|w| w.is_none()).count();
+            if seed == 3 {
+                assert_eq!(open, 1);
+            }
+            // Never the same drone twice.
+            let mut used = vec![false; swarm.len()];
+            for (t, w) in joint.iter().enumerate() {
+                let Some(d) = *w else { continue };
+                assert!(!used[d], "seed {seed}: drone {d} twice");
+                used[d] = true;
+                // Joint picks an able drone (no penalty) and never beats the single winner.
+                assert!(
+                    tasks[t].kind.able(swarm[d].role, ok[d]),
+                    "seed {seed} task {t}"
+                );
+                assert!(c.get(t, single[t]) <= c.get(t, d));
+            }
+            // So over the staffed tasks the joint total is at least the singles' total.
+            let singles: f64 = (0..c.n_tasks)
+                .filter(|&t| joint[t].is_some())
+                .map(|t| c.get(t, single[t]))
+                .sum();
+            assert!(singles <= assignment_cost(&c, &joint) + 1e-9);
+            // Deterministic.
+            assert_eq!(joint, joint_winners(&c, &cfg));
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn print_oracle_stats() {
+        // How often the two labels differ, and what sharing drones would save.
+        let cfg = SimConfig::default();
+        let (mut tasks_total, mut differ, mut shared, mut open) = (0, 0, 0, 0);
+        let (mut sum_single, mut sum_joint) = (0.0, 0.0);
+        for seed in 0..100 {
+            let (swarm, live) = live_snapshot(seed, &cfg);
+            let tasks = spawn_tasks(&swarm, &cfg, &mut ChaCha8Rng::seed_from_u64(seed));
+            let ok = relay_within_two_hops(&live, &swarm);
+            let c = cost_matrix(&swarm, &tasks, &ok, &cfg);
+            let single = single_winners(&c);
+            let joint = joint_winners(&c, &cfg);
+            for t in 0..c.n_tasks {
+                tasks_total += 1;
+                if joint[t].is_none() {
+                    open += 1;
+                    continue;
+                }
+                if joint[t] != Some(single[t]) {
+                    differ += 1;
+                }
+                if single.iter().filter(|&&w| w == single[t]).count() > 1 {
+                    shared += 1;
+                }
+                sum_single += c.get(t, single[t]);
+            }
+            sum_joint += assignment_cost(&c, &joint);
+        }
+        println!("tasks {tasks_total}, left open by the joint oracle {open}");
+        println!("single winner shared with another task: {shared}");
+        println!("joint winner differs from single winner (staffed tasks): {differ}");
+        println!(
+            "total cost: singles {sum_single:.1} km, joint {sum_joint:.1} km (+{:.1} %)",
+            100.0 * (sum_joint / sum_single - 1.0)
+        );
     }
 
     #[test]
