@@ -20,6 +20,7 @@ AERIE/
 │   │       ├── drone.rs    DroneId, SquadId, Role, Vec2, Drone
 │   │       ├── spawn.rs    spawn_swarm: places the squads and drones
 │   │       ├── jamming.rs  Jammer, Ridge, jam_power (falloff, ridge shadow), place_jamming (D02), true_power, readings, jammed_labels, fail_links
+│   │       ├── links.rs    the link model (D03): margin, LiveGraph, live_graph
 │   │       ├── graphs.rs   declares the graph modules below
 │   │       └── graphs/
 │   │           ├── epsilon/   epsilon_graph (D00 rule), textbook_epsilon_graph, tests
@@ -59,6 +60,7 @@ Small programs in `crates/swarmsim/examples/`. Run with `--release`.
 | Example | Command | What it prints |
 |---|---|---|
 | ε-graph stats | `cargo run --release -p swarmsim --example epsilon_stats` | one row per seed: links, mean degree, components, largest, isolated, share between squads; then the mean and the targets (D01) |
+| Link stats | `cargo run --release -p swarmsim --example link_stats` | link-model calibration (D03): for several N0 and scale settings, links lost, live degree, far links kept, zone links kept, splits, stranded drones, one-way counts |
 | Jamming stats | `cargo run --release -p swarmsim --example jamming_stats` | step 2 end to end, one row per seed: jammed share, relays jammed, links lost, pieces, stranded drones, readings on the wrong side; then the summary (D02) |
 
 ## GUIs
@@ -127,7 +129,8 @@ Place drones by hand and watch the comm graph form. It calls the real builders
 
 ### Jamming playground
 
-Place jammers and a ridge, and see the jamming power everywhere. The heatmap calls the
+Place jammers and a ridge, and see the jamming power everywhere. Two tabs at the top of
+the left panel: **Seed swarm** (a spawned swarm, everything below) and **Build your own**. The heatmap calls the
 real `swarmsim::jamming::jam_power` at every pixel (0.2 km).
 
 - **Tools:** *Move* (drag jammers, a ridge end or the whole ridge; drag empty space to pan),
@@ -164,11 +167,54 @@ real `swarmsim::jamming::jam_power` at every pixel (0.2 km).
 
   The red ring is always the label. Turn the heatmap off to see the colours better.
   Hover a drone for its truth, reading and noise.
+- **Link rule (2e):** *signal vs jamming (D03)* uses `live_graph`: a direction works when the
+  sender's signal is at least N0 + jamming at the receiver, and a link needs both directions.
+  *Either end jammed (D02)* is the old `fail_links` rule, kept for comparison. Sliders for the
+  noise floor N0 and each role's signal scale (smaller = louder transmitter = resists jamming).
+
+  **N0 works backwards from what you might expect: lower N0 = fewer links under jamming.**
+  Transmit power is tied to N0, `tx = N0 · (1 + (range / scale)²)`, so that each drone still
+  reaches its range on a quiet day. The margin then splits in two:
+
+  ```
+  margin = (1 + (r/s)²) / (1 + (d/s)²)  ×  N0 / (N0 + jam)
+           └──── geometry only ────┘      └ jamming penalty ┘
+  ```
+
+  With no jammer the penalty is 1 and N0 cancels out: same graph for any N0. With a jammer,
+  a small N0 means quiet drones that the jammer drowns easily (N0 = 0.05, jam = 0.1: margins
+  fall to a third), a large N0 means loud drones (N0 = 0.2, jam = 0.1: they lose a third).
+  So N0 sets how loud the drones are against the jammer.
+
+  | Link style | Meaning |
+  |---|---|
+  | solid, orange to green | live link, coloured by margin (orange ≈ 1, about to break; green ≥ 10) |
+  | dashed, teal, with an arrow | one-way: only sender → receiver works (the receiver is jammed) |
+  | dashed, red | dead: neither direction works |
+
+  Hover a drone for its live, geometric and one-way links, transmit power and scale.
+- **Hover a link** (either tab): it is highlighted, and the tooltip shows the distance, the
+  Gaussian weight, its state (live with its margin, one-way, dead), and for each direction
+  the signal, N0 + jamming at the receiver, and the margin (✔ when ≥ 1).
+- **Build your own tab:** place drones by hand with the *Add drone* tool (role and squad
+  picked in the left panel), drag them, right-click to delete. The list shows each drone's
+  role, squad and position, all editable. Each drone is labelled `#i S<squad>` on the map.
+  Links come from `epsilon_graph` (no-jammer ranges) then `live_graph`, and *Write both
+  margins* puts `a→b` and `b→a` on every link (✘ below 1). Jammers, the ridge and every
+  slider work as in the other tab. **One-way arrows** (sender → receiver, D03 rule): every
+  ordered pair is checked, and each direction that works while the reverse does not gets a
+  solid arrow. Teal = a geometric link cut one way by jamming. Violet = not a geometric link,
+  because the ranges differ (a relay heard by a recon drone beyond 2.5 km). Both come from
+  `live_graph`, which keeps them in two lists: `cut_one_way` and `range_one_way` (D03, option b). Presets: *Paper check* (jammer at (10, 10); recon at 14
+  and 15 km, relay at 17 km on y = 10), *Squad at the zone edge*, *Relay chain*, *Clear drones*.
 - **Right panel:** power against distance (open ground and behind the ridge), the value table,
   the power at the cursor per jammer (clear or blocked), the effect on the swarm before
   and after jamming from `fail_links` (links, mean degree, components, isolated drones), and readings against
   truth: counts per colour, the measured noise (mean, sd), and a scatter plot of truth (x)
   against reading (y) for every drone. Hover a dot to ring that drone on the map.
+  *How far each role is heard*: range against the receiver's distance to the jammer, one curve
+  per role, and a table at 20, 12, 4 and 0 km with each role's transmit power. Use it to
+  calibrate N0 and the scales.
 
 ## Adding things
 
