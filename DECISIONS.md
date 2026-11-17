@@ -162,3 +162,88 @@ the max. Noise powers add, so **sum** is the likely choice. To decide when a mis
   that contradicts their label. Classifying "jammed" from one's own reading is easy.
   M1 hides 90 % of the readings, which is where the graph has to do the work. If M1 still
   turns out too easy, raise noise_sd or label from a softer zone.
+
+---
+
+## D03. Link failure by signal against jamming
+
+```
+Chose:     a link direction works when the sender's signal ≥ N0 + jamming at the receiver;
+           a link needs both. N0 = 0.5, signal scales recon 0.5, RF 0.7, relay 0.3,
+           compute 1.0 km. One-way directions kept, in two lists.
+Rejected:  D02's either-end rule; the plan's N0 = 0.05; the margin as the edge weight;
+           one-way links only from jamming (option a); one mixed one-way list
+Evidence:  cargo run --release -p swarmsim --example link_stats  (seeds 0-99)
+Cost:      a second O(n²) pass for one-way directions; about 720 range one-way directions
+           per seed, so the directed graph is mostly relays broadcasting
+Revisit:   M9 (the extra pass needs the grid neighbour search), several jammers,
+           M2 / M6 if the directed graph is dominated by relays
+```
+
+Replaces the link-failure part of D02 ("a link fails when either end is jammed"). D02's
+placement, readings and zone labels stay. `fail_links` is kept for comparison only.
+
+**Why.** Under D02 a jammed drone lost every link, even to a neighbour 100 m away, and
+relays were as fragile as anything else. Real links fail when the jamming at the receiver
+drowns the sender's signal: close neighbours and loud transmitters get through.
+
+**The model** (`swarmsim::links`).
+
+```
+tx_power(role) = N0 · (1 + (range / scale)²)
+signal(i→j)    = tx_power(i) / (1 + (d_ij / scale_i)²)
+margin(i→j)    = signal(i→j) / (N0 + jam(j))          jam(j) = true power at j
+i→j works when margin ≥ 1;  link i–j is live when both directions work
+```
+
+- **Transmit power comes from the range.** With no jammer the signal falls to N0 exactly at
+  the range, so the live graph equals the geometric graph (`epsilon_graph`, D00 / D01 ranges
+  unchanged). Unit test: `no_jammer_gives_the_geometric_graph`.
+- **Signal scale per role** sets how well a role holds up under jamming, separately from its
+  range. Smaller = louder transmitter. Relays toughest (0.3), compute weakest (1.0).
+- **N0 works backwards from intuition.** Since tx is tied to N0, the margin splits into
+  `geometry × N0 / (N0 + jam)`. With no jammer N0 cancels out; with a jammer a small N0 means
+  quiet drones that the jammer drowns. N0 sets how loud the drones are against the jammer.
+- **Jamming hits the receiver.** A drone near the jammer can be heard but cannot hear.
+- **Ridges** cut the jamming (× 0.1, D02) but do not block drone-to-drone signals.
+- **The zone label is unchanged** (true power ≥ 0.5 P0) and still drives placement (5–30 %).
+  It no longer means the drone is cut off.
+
+**What `live_graph` returns** (`LiveGraph`).
+- `graph`: live links, **with their Gaussian weights**. The margin is ≥ 1 and unbounded, so
+  using it as the weight would break label propagation, Laplacians and GCN normalisation
+  (M1, M3, M6). Rejected.
+- `margins`: the smaller of the two margins per live link, as an edge feature (M5).
+- `cut_one_way`: geometric links cut one way by jamming (sender, receiver).
+- `range_one_way`: directions between drones that are not geometric neighbours: the
+  longer-range drone is heard beyond the other's range (a relay heard by a recon drone at
+  5 km). Option (b): physically real, and the plan's directed graph for M2 and M6. Kept in
+  its own list because it is large; a mission picks what it needs.
+
+**Calibration over seeds 0–99** (ranges 2.5 / 16 km, default jamming)
+
+| N0 | scales (recon, RF, relay, compute) | Links lost | Live degree | Far links kept | Zone links kept | Seeds split | Stranded | Cut one-way | Range one-way |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 0.05 (plan) | 0.5, 0.7, 0.3, 1.0 | 48 % | 4.57 | 73 % | 6 % | 100 | 39.9 | 86 | 468 |
+| 0.2 | 0.5, 0.7, 0.3, 1.0 | 26 % | 6.46 | 91 % | 27 % | 92 | 14.1 | 59 | 642 |
+| **0.5** | **0.5, 0.7, 0.3, 1.0** | **15 %** | **7.42** | **96 %** | **51 %** | **38** | **6.3** | **37** | **720** |
+| 0.5 | 1.0, 1.0, 1.0, 1.0 | 16 % | 7.33 | 96 % | 45 % | 46 | 6.7 | 39 | 719 |
+| 1.0 | 0.5, 0.7, 0.3, 1.0 | 9 % | 7.94 | 98 % | 69 % | 16 | 4.0 | 24 | 759 |
+| 2.0 | 0.5, 0.7, 0.3, 1.0 | 5 % | 8.28 | 99 % | 82 % | 12 | 2.9 | 14 | 783 |
+
+*Far*: both ends ≥ 12 km from the jammer. *Zone*: both ends in the jammed zone.
+*Split*: 2+ pieces of at least 2 drones (10 seeds are split before jamming, D01).
+
+**Reading the table.**
+- **The plan's N0 = 0.05 is rejected:** the long tail thins the whole swarm (73 % of far
+  links kept, every seed split) instead of opening a hole.
+- **N0 is the main knob; the scales barely matter** at a given N0 (relays at 16 km are
+  already near their loudest).
+- **N0 = 0.5** loses 15 % of links (D02: 13 %), keeps 96 % far away, keeps half the links
+  inside the zone (a squad there stays partly connected, as the plan wants), and still splits
+  38 / 100 seeds (D02: 37), so M8 has positive examples.
+
+**Departures from Project_Plan.** N0 = 0.5 instead of 0.05. The plan's range table was
+written for 5 / 9 km; with D01's 2.5 / 16 km the numbers differ (see the jamming
+playground's "How far each role is heard"). The plan's 3 km compute range is not adopted:
+compute is made the weakest through its scale instead, so D01 stands.

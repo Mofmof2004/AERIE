@@ -42,6 +42,26 @@ impl Role {
             Role::Relay => config.range_long,
         }
     }
+
+    /// How fast this role's signal fades with distance, km (decision D03).
+    /// Smaller = louder transmitter = holds up better under jamming.
+    pub fn signal_scale(self, config: &SimConfig) -> f64 {
+        match self {
+            Role::Recon => config.signal_scale_recon,
+            Role::RfSensing => config.signal_scale_rf,
+            Role::Compute => config.signal_scale_compute,
+            Role::Relay => config.signal_scale_relay,
+        }
+    }
+
+    /// Transmit power, in units of P0: N0 · (1 + (range / scale)²), chosen so that with
+    /// no jammer the signal drops to the noise floor exactly at the radio range (D03).
+    pub fn tx_power(self, config: &SimConfig) -> f64 {
+        config.noise_floor
+            * (1.0
+                + ((self.radio_range(config) / self.signal_scale(config))
+                    * (self.radio_range(config) / self.signal_scale(config))))
+    }
 }
 
 /// A 2D point or vector in the arena, in km (velocities in km per step).
@@ -186,6 +206,73 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(Role::Relay.radio_range(&long_relays), 12.0);
+    }
+
+    /// Every scale set to a different value, so a swapped match arm shows up.
+    fn distinct_scales() -> SimConfig {
+        SimConfig {
+            signal_scale_recon: 0.1,
+            signal_scale_rf: 0.2,
+            signal_scale_relay: 0.3,
+            signal_scale_compute: 0.4,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn signal_scale_by_role() {
+        let cfg = distinct_scales();
+        assert_eq!(Role::Recon.signal_scale(&cfg), 0.1);
+        assert_eq!(Role::RfSensing.signal_scale(&cfg), 0.2);
+        assert_eq!(Role::Relay.signal_scale(&cfg), 0.3);
+        assert_eq!(Role::Compute.signal_scale(&cfg), 0.4);
+    }
+
+    #[test]
+    fn tx_power_hand_values() {
+        // Scale 1 everywhere: N0 (1 + r²). Recon 0.05 * 7.25, relay 0.05 * 257.
+        // N0 pinned at 0.05 so tuning the default cannot break the hand values.
+        let cfg = SimConfig {
+            noise_floor: 0.05,
+            signal_scale_recon: 1.0,
+            signal_scale_relay: 1.0,
+            ..Default::default()
+        };
+        assert!((Role::Recon.tx_power(&cfg) - 0.3625).abs() < 1e-12);
+        assert!((Role::Relay.tx_power(&cfg) - 12.85).abs() < 1e-12);
+        // Halving the scale makes the transmitter louder: 0.05 * (1 + 25) = 1.3.
+        let loud = SimConfig {
+            signal_scale_recon: 0.5,
+            ..cfg
+        };
+        assert!((Role::Recon.tx_power(&loud) - 1.3).abs() < 1e-12);
+    }
+
+    #[test]
+    fn with_no_jammer_the_signal_reaches_the_noise_floor_exactly_at_the_range() {
+        // signal(d) = P / (1 + (d / s)²) equals N0 at d = range, for every role and scale.
+        for cfg in [SimConfig::default(), distinct_scales()] {
+            for role in Role::ALL {
+                let (r, s) = (role.radio_range(&cfg), role.signal_scale(&cfg));
+                let signal_at_range = role.tx_power(&cfg) / (1.0 + (r / s).powi(2));
+                assert!(
+                    (signal_at_range - cfg.noise_floor).abs() < 1e-12,
+                    "{role:?}: {signal_at_range}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn smaller_scale_means_louder_transmitter() {
+        let mut cfg = SimConfig::default();
+        let mut last = 0.0;
+        for s in [2.0, 1.0, 0.5, 0.25] {
+            cfg.signal_scale_recon = s;
+            let p = Role::Recon.tx_power(&cfg);
+            assert!(p > last, "scale {s}: {p}");
+            last = p;
+        }
     }
 
     #[test]

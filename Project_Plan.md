@@ -134,9 +134,9 @@ SwarmSim is a small Rust crate that generates every dataset in the project, so y
 | Drones | 100 by default. Recon 50%, RF sensing 15%, relays 20%, compute 15%. |
 | Recon | Cameras. Detects contacts with a noisy confidence score. |
 | RF sensing | Measures radio noise level at its position. |
-| Relay | Long radio range. Holds the network together. |
-| Compute | Fuses imagery from recon drones. |
-| Node features | Position, velocity, battery, sensor quality, compute capacity, radio range, role one-hot. |
+| Relay | Strongest transmitter. Its links survive jamming longest, so it holds the network together. |
+| Compute | Fuses imagery from recon drones. Weakest transmitter, so other drones have to come close to reach it. |
+| Node features | Position, velocity, battery, sensor quality, compute capacity, transmit power, role one-hot. |
 | Motion | Squads of about 10 patrol waypoints with simple cohesion and separation. An on-station mode freezes the formation for static-graph missions. |
 | Comm graph | Three builders from lecture 1: epsilon-ball on radio range, k-nearest neighbours, and a correlation network from sensor time series. |
 | Directed graph | Data flow: recon sends to relays, relays send to compute nodes. Used whenever a lecture covers directed graphs. |
@@ -145,7 +145,7 @@ SwarmSim is a small Rust crate that generates every dataset in the project, so y
 
 | Feature | What it does in SwarmSim |
 | --- | --- |
-| Jammers | Emitters whose power falls off smoothly with distance and is cut sharply by ridges. Links inside strong jamming fail. Jammers can move. Jamming power is the main graph signal of the project. |
+| Jammers | Emitters whose power falls off smoothly with distance and is cut sharply by ridges. A link survives only where the sender's signal beats noise plus jamming at the receiver. Jammers can move. Jamming power is the main graph signal of the project. |
 | Spoofing | One drone, or a cluster of neighbours, reports false readings. |
 | Attrition | Drones removed at random, by region, or most-connected first. Replacements can join. |
 | Contacts | Unknown objects crossing sectors. They create "hold a track" tasks. |
@@ -161,19 +161,54 @@ SwarmSim is a small Rust crate that generates every dataset in the project, so y
 | --- | --- |
 | Arena | 40 km by 20 km |
 | Squads | 10 squads of 10, each with about 5 recon, 2 relays, and 3 split between RF sensing and compute |
-| Radio range | 5 km for recon, RF sensing and compute. 9 km for relays |
-| Link weight | exp(-d^2 / (2σ^2)) with σ at half the radio range. Zero beyond range |
+| Radio range | With no jamming: 5 km for recon and RF sensing, 9 km for relays, 3 km for compute nodes |
+| Link weight | exp(-d^2 / (2σ^2)) with σ at half the no-jamming range, on the geometric graph. The live graph carries the link margin instead |
 | Target mean degree | 8 to 10, with one connected component before any jamming |
-| Jammer power at distance d | P0 / (1 + (d / d0)^2) with d0 = 4 km. Multiplied by 0.1 behind a ridge |
-| Link failure | A link fails when jamming power at either end is above 0.5 P0. In open ground that gives a dead zone of radius d0 around the jammer |
+| Jammer power at distance d | P0 / (1 + (d / d0)^2) with P0 = 1 and d0 = 4 km. Multiplied by 0.1 behind a ridge |
+| Link failure | One direction of a link fails when the sender's signal at the receiver drops below noise plus jamming. See the link model below |
+| Noise floor N0 | 0.05, in units of P0 |
+| Zone label | True jamming power of at least 0.5. In open ground that is a disc of radius d0 around the jammer. It no longer means the drone is cut off |
 | Sensor noise | Gaussian, standard deviation 10% of P0 |
 | Spoofed reading | True reading plus a constant bias of 30% of P0 |
 | Flight length | 200 steps, drone speed 0.2 km per step |
 | Attrition | Each drone lost with probability 0.2% per step, which removes about a third of the swarm over one flight |
 
+**The link model.** A link is decided by signal against jamming, not by a fixed radius. Jamming hits the receiver.
+
+```
+signal(i→j) = P_i / (1 + d_ij^2)               d in km
+jam(j)      = P0 / (1 + (d_j / d0)^2)          d_j = distance from j to the jammer
+margin(i→j) = signal(i→j) / (N0 + jam(j))
+i→j works when margin(i→j) ≥ 1
+link i–j exists when both directions work
+```
+
+- **Transmit power comes from the no-jamming range.** Set P\_i = N0 (1 + r\_i^2). With no jammer this reproduces the min-range rule exactly, because the weaker transmitter limits the link.
+- **Two graphs.** The geometric graph holds every pair within no-jamming range and is built once. The live graph is the subset whose margin is at least 1 in both directions. Jamming only shrinks ranges, so the live graph is always inside the geometric one.
+- **Link quality.** Store the smaller of the two margins on each live edge. It is the edge feature for Mission 5 and replaces a jammed flag.
+- **A directed graph for free.** Keep the one-way links as well. A drone near the jammer can be heard but cannot hear. Use them wherever a lecture covers directed graphs (Missions 2 and 6).
+- **Ridges.** Behind a ridge the jamming power is multiplied by 0.1 before it enters the rule. Ridges do not block drone-to-drone signals.
+
+How far each role can be heard, by where the receiving drone sits:
+
+| Receiver's distance to the jammer | Recon | Relay | Compute |
+| --- | --- | --- | --- |
+| No jammer | 5 km | 9 km | 3 km |
+| 12 km | 2.8 km | 5.1 km | 1.5 km |
+| 4 km | 1.2 km | 2.5 km | not heard |
+| 0 km | 0.5 km | 1.7 km | not heard |
+
+Relays hold out longest and compute nodes drop first. A squad inside the zone stays connected internally and loses its links outward, which is the cut-off squad that Missions 1 and 8 need.
+
+**Check these before moving on**
+
+- [ ] With no jammer, the live graph equals the geometric graph. Make it a unit test.
+- [ ] On three hand-placed drones, the margins match your calculation on paper.
+- [ ] The swarm outside the zone stays connected. The falloff has a long tail: 20 km from the jammer a recon drone's range is still down from 5 to about 3.7 km. If the swarm fragments, lower P0 relative to N0 or use a steeper falloff.
+
 **Decide before you code.** Log these as entry D00 in `DECISIONS.md`. They are cheap to settle now and expensive to change in Mission 5.
 
-- **Link rule.** Two drones are linked when their distance is at most min(range\_i, range\_j), because a working link has to go both ways. Relays then reach each other at up to 9 km and form the backbone between squads.
+- **Link rule.** A link needs both directions to work. With no jamming that means a distance of at most min(range\_i, range\_j), so relays reach each other at up to 9 km and form the backbone between squads. Under jamming the link model above decides.
 - **kNN symmetry.** A kNN graph is directed. Take the union: i and j are linked when either one picks the other. The mutual version can leave drones isolated.
 - **Squad spread.** A tight squad of 10 is almost a complete graph, so a mean degree of 8 to 10 can come from inside the squads alone. Also require one connected component before jamming, and aim for roughly a quarter of all links to cross between squads. The quarter is a starting target to tune. Expect squad labels to agree across almost every link.
 - **IDs.** Wrap drone and squad IDs in their own types, `DroneId` and `SquadId`, so an ID can never be used as a vector index by accident. This matters once attrition starts.

@@ -42,7 +42,8 @@ pub struct SimConfig {
     /// Multiplier on jamming power behind the ridge (the ridge shadow).
     pub ridge_factor: f64,
     /// Jamming power (as a fraction of P0) at or above which a drone is in the jammed
-    /// zone and all its links fail.
+    /// zone (the zone label, and the placement bounds). Links no longer fail on this
+    /// threshold: the signal-against-jamming rule decides (D03).
     pub jam_threshold: f64,
     /// Standard deviation of the Gaussian sensor noise on jam readings, as a fraction of P0.
     pub noise_sd: f64,
@@ -50,6 +51,25 @@ pub struct SimConfig {
     pub jam_frac_min: f64,
     /// ...and at most this fraction (decision D02).
     pub jam_frac_max: f64,
+    /// N0: background radio noise at every receiver, in units of P0 (decision D03).
+    /// A link direction works when signal ≥ noise_floor + jamming.
+    ///
+    /// Counter-intuitive: a **lower** N0 gives **fewer** links under jamming. Transmit
+    /// power is tied to it (`tx = N0 · (1 + (range / scale)²)`, so each drone still
+    /// reaches its range), and the margin splits into
+    /// `geometry × N0 / (N0 + jamming)`. With no jammer N0 cancels out and the graph is
+    /// the same for any N0; with a jammer, a small N0 means quiet drones that the jammer
+    /// drowns easily. N0 really sets how loud the drones are against the jammer.
+    pub noise_floor: f64,
+    /// Signal fade scale of a recon drone, km: signal = P / (1 + (d / scale)²).
+    /// Smaller = holds up better under jamming. Does not change the no-jammer range (D03).
+    pub signal_scale_recon: f64,
+    /// Same for RF-sensing drones, km.
+    pub signal_scale_rf: f64,
+    /// Same for relays, km.
+    pub signal_scale_relay: f64,
+    /// Same for compute drones, km.
+    pub signal_scale_compute: f64,
 }
 
 impl Default for SimConfig {
@@ -72,6 +92,11 @@ impl Default for SimConfig {
             jam_frac_min: 0.05,
             jam_frac_max: 0.30,
             noise_sd: 0.1,
+            noise_floor: 0.5,
+            signal_scale_recon: 0.5,
+            signal_scale_rf: 0.7,
+            signal_scale_relay: 0.3,
+            signal_scale_compute: 1.0,
         }
     }
 }
