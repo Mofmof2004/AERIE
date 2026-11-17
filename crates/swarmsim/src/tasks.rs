@@ -4,9 +4,11 @@
 
 use crate::config::SimConfig;
 use crate::drone::{Drone, Role, Vec2};
+use aerie_graph::EdgeList;
 use rand::RngExt;
 use rand_chacha::ChaCha8Rng;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 
 /// Stable task identity. Its own type, like `DroneId`, so it cannot be mixed up with a
 /// drone ID or used as an index by accident (D00).
@@ -143,6 +145,43 @@ pub fn spawn_tasks(swarm: &[Drone], config: &SimConfig, rng: &mut ChaCha8Rng) ->
         tasks.push(task);
     }
     tasks
+}
+/// The relay rule (step 3b): for every drone, whether a relay is at most 2 hops away on the
+/// live graph. A relay counts at 0 hops. Observe and Track need it (`needs_relay`): their
+/// data must reach a relay to leave the area.
+///
+/// One small breadth-first search per drone, stopped at depth 2. The queue holds
+/// (drone, hops from the start), so each entry knows its own depth. Two hops on purpose:
+/// a GNN with K layers sees exactly K hops, so a 2-layer GNN can learn this rule.
+pub fn relay_within_two_hops(live: &EdgeList, swarm: &[Drone]) -> Vec<bool> {
+    let neighbours = live.neighbours();
+    let mut result: Vec<bool> = Vec::new();
+
+    for i in 0..swarm.len() {
+        // A relay is 0 hops from itself.
+        let mut found = swarm[i].role == Role::Relay;
+        // Each entry is (drone, its distance from i).
+        let mut queue: VecDeque<(usize, usize)> = VecDeque::new();
+        queue.push_back((i, 0));
+
+        'search: while let Some((drone, hop)) = queue.pop_front() {
+            if found {
+                break;
+            }
+            if hop == 2 {
+                continue; // don't look further than 2 hops
+            }
+            for &j in &neighbours[drone] {
+                if swarm[j].role == Role::Relay {
+                    found = true;
+                    break 'search;
+                }
+                queue.push_back((j, hop + 1));
+            }
+        }
+        result.push(found);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -291,6 +330,166 @@ mod tests {
             ..SimConfig::default()
         };
         assert_eq!(snapshot(3, &cfg).1.len(), 50);
+    }
+
+    /// Drones in a row on the x axis, 1 km apart; `relays` lists the relay indices.
+    fn row(n: u32, relays: &[u32]) -> Vec<Drone> {
+        (0..n)
+            .map(|i| {
+                let role = if relays.contains(&i) {
+                    Role::Relay
+                } else {
+                    Role::Recon
+                };
+                Drone::new(
+                    crate::drone::DroneId(i),
+                    crate::drone::SquadId(0),
+                    role,
+                    Vec2 {
+                        x: i as f64,
+                        y: 0.0,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// A graph from (src, dst) pairs, weight 1.
+    fn graph(n: u32, pairs: &[(u32, u32)]) -> EdgeList {
+        let edges = pairs
+            .iter()
+            .map(|&(src, dst)| aerie_graph::Edge {
+                src,
+                dst,
+                weight: 1.0,
+            })
+            .collect();
+        EdgeList { n, edges }
+    }
+
+    /// The path 0 - 1 - 2 - 3 - 4.
+    fn path5() -> EdgeList {
+        graph(5, &[(0, 1), (1, 2), (2, 3), (3, 4)])
+    }
+
+    /// Another way to get the same answer, to check against: one BFS started from all
+    /// relays at once, giving every drone its distance to the nearest relay.
+    fn hops_from_relays(live: &EdgeList, swarm: &[Drone]) -> Vec<Option<usize>> {
+        let neighbours = live.neighbours();
+        let mut hops = vec![None; swarm.len()];
+        let mut queue = VecDeque::new();
+        for (i, d) in swarm.iter().enumerate() {
+            if d.role == Role::Relay {
+                hops[i] = Some(0);
+                queue.push_back(i);
+            }
+        }
+        while let Some(i) = queue.pop_front() {
+            let h = hops[i].unwrap();
+            for &j in &neighbours[i] {
+                if hops[j].is_none() {
+                    hops[j] = Some(h + 1);
+                    queue.push_back(j);
+                }
+            }
+        }
+        hops
+    }
+
+    #[test]
+    fn prediction_1_path_with_a_relay_at_one_end() {
+        let ok = relay_within_two_hops(&path5(), &row(5, &[0]));
+        assert_eq!(ok, [true, true, true, false, false]);
+    }
+
+    #[test]
+    fn prediction_2_relays_at_both_ends_cover_the_path() {
+        let ok = relay_within_two_hops(&path5(), &row(5, &[0, 4]));
+        assert_eq!(ok, [true; 5]);
+    }
+
+    #[test]
+    fn prediction_3_a_group_without_a_relay_is_cut_off() {
+        // 0 - 1 with a relay at 0, and 2 - 3 with none: hops never cross groups.
+        let ok = relay_within_two_hops(&graph(4, &[(0, 1), (2, 3)]), &row(4, &[0]));
+        assert_eq!(ok, [true, true, false, false]);
+    }
+
+    #[test]
+    fn a_relay_counts_at_zero_hops_even_alone() {
+        // No links at all: only the relay itself passes.
+        let ok = relay_within_two_hops(&graph(3, &[]), &row(3, &[1]));
+        assert_eq!(ok, [false, true, false]);
+        // No relay anywhere: nobody passes.
+        assert_eq!(relay_within_two_hops(&path5(), &row(5, &[])), [false; 5]);
+    }
+
+    #[test]
+    fn links_count_in_both_directions() {
+        // Each link is stored once with src < dst. The relay is at the dst end here,
+        // so a search that only follows src -> dst would miss it.
+        let ok = relay_within_two_hops(&graph(3, &[(0, 1), (1, 2)]), &row(3, &[2]));
+        assert_eq!(ok, [true, true, true]);
+    }
+
+    #[test]
+    fn a_cycle_does_not_loop_forever() {
+        // Triangle 0-1-2 plus a tail 2-3-4-5; relay at 5. Drone 3 is 2 hops, 2 is 3.
+        let g = graph(6, &[(0, 1), (1, 2), (0, 2), (2, 3), (3, 4), (4, 5)]);
+        let ok = relay_within_two_hops(&g, &row(6, &[5]));
+        assert_eq!(ok, [false, false, false, true, true, true]);
+    }
+
+    #[test]
+    fn matches_a_bfs_from_all_relays_on_real_seeds() {
+        // Searching out from each drone or out from all relays must agree.
+        let cfg = SimConfig::default();
+        for seed in 0..20 {
+            let (swarm, live) = live_snapshot(seed, &cfg);
+            let ok = relay_within_two_hops(&live, &swarm);
+            let hops = hops_from_relays(&live, &swarm);
+            for i in 0..swarm.len() {
+                assert_eq!(
+                    ok[i],
+                    hops[i].is_some_and(|h| h <= 2),
+                    "seed {seed}, drone {i}"
+                );
+            }
+        }
+    }
+
+    /// Swarm and live graph of a seed, in the dataset order.
+    fn live_snapshot(seed: u64, cfg: &SimConfig) -> (Vec<Drone>, EdgeList) {
+        let mut rng = ChaCha8Rng::seed_from_u64(seed);
+        let swarm = spawn_swarm(cfg, &mut rng);
+        let (jammer, ridge) = place_jamming(&swarm, cfg, &mut rng);
+        let truth = true_power(&swarm, &jammer, &ridge, cfg);
+        let geometric = crate::graphs::epsilon::epsilon_graph(&swarm, cfg);
+        let live = crate::links::live_graph(&geometric, &swarm, &truth, cfg).graph;
+        (swarm, live)
+    }
+
+    #[test]
+    #[ignore]
+    fn print_relay_share() {
+        let cfg = SimConfig::default();
+        let mut shares = Vec::new();
+        let mut hop_counts = [0usize; 4]; // 0, 1, 2, more or never
+        for seed in 0..100 {
+            let (swarm, live) = live_snapshot(seed, &cfg);
+            let ok = relay_within_two_hops(&live, &swarm);
+            shares.push(ok.iter().filter(|&&b| b).count() as f64 / swarm.len() as f64);
+            for h in hops_from_relays(&live, &swarm) {
+                hop_counts[h.unwrap_or(3).min(3)] += 1;
+            }
+        }
+        shares.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let mean = shares.iter().sum::<f64>() / shares.len() as f64;
+        println!(
+            "mean {mean:.3} min {:.3} median {:.3} max {:.3}",
+            shares[0], shares[50], shares[99]
+        );
+        println!("hops 0/1/2/more-or-never: {hop_counts:?}");
     }
 
     #[test]
