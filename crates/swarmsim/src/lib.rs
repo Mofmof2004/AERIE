@@ -6,3 +6,4 @@ pub mod graphs;
 pub mod jamming;
 pub mod links;
 pub mod spawn;
+pub mod tasks;

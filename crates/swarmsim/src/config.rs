@@ -70,6 +70,12 @@ pub struct SimConfig {
     pub signal_scale_relay: f64,
     /// Same for compute drones, km.
     pub signal_scale_compute: f64,
+    /// Tasks per snapshot (step 3).
+    pub n_tasks: usize,
+    /// Share of tasks placed near a drone; the rest are uniform over the arena.
+    pub task_near_frac: f64,
+    /// A near task lies within this many km of a random drone, in x and in y.
+    pub task_near_radius: f64,
 }
 
 impl Default for SimConfig {
@@ -97,6 +103,9 @@ impl Default for SimConfig {
             signal_scale_rf: 0.7,
             signal_scale_relay: 0.3,
             signal_scale_compute: 1.0,
+            n_tasks: 50,
+            task_near_frac: 0.5,
+            task_near_radius: 3.0,
         }
     }
 }
