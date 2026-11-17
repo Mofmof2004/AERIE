@@ -3,7 +3,9 @@
 //! Run with `cargo run --release -p aerie-viz` (the default GUI)
 //! or `cargo run --release -p aerie-viz --bin swarm_viewer`.
 //! Left panel: mission, scenario and layers. Centre: the arena map
-//! (scroll to zoom, drag to pan, click a drone). Right panel: details.
+//! (scroll to zoom, drag to pan, click a drone or a task). Right panel: details.
+//! Each seed is built in the dataset order with one RNG: spawn_swarm, place_jamming,
+//! true_power, readings, live_graph, spawn_tasks.
 
 use aerie_graph::EdgeList;
 use eframe::egui::{self, RichText};
@@ -13,9 +15,16 @@ use swarmsim::config::SimConfig;
 use swarmsim::drone::{Drone, Role};
 use swarmsim::graphs::epsilon::epsilon_graph;
 use swarmsim::graphs::stats::stats;
+use swarmsim::jamming::{jammed_labels, place_jamming, readings, true_power};
+use swarmsim::links::live_graph;
 use swarmsim::spawn::spawn_swarm;
+use swarmsim::tasks::{TaskKind, spawn_tasks};
 
-use aerie_viz::map::{self, ColorBy, Layers, LinkColor, MapView, RangeCircles};
+use aerie_viz::map::{
+    self, ColorBy, JAMMED_DRONE_COLOR, Layers, LinkColor, LinkSource, MapView, RangeCircles,
+    Snapshot, jam_field, n_near_tasks, task_color, task_letter, task_name,
+};
+use aerie_viz::launch::{GUIS, launch};
 use aerie_viz::mission::Mission;
 use aerie_viz::squads::{SquadInfo, cell_count, cell_options, squad_infos};
 use aerie_viz::style::{ramp, role_color, role_name, role_shape_name, squad_color, swatch};
@@ -48,6 +57,15 @@ struct Viewer {
     view: MapView,
     /// Index into `swarm` of the selected drone.
     selected: Option<usize>,
+    /// Jamming, live graph and tasks for this seed; `None` when place_jamming found no
+    /// placement (possible with unusual configs).
+    snapshot: Option<Snapshot>,
+    /// Index into the snapshot's tasks of the selected task.
+    selected_task: Option<usize>,
+    /// The settings window (every SimConfig field) is open.
+    show_settings: bool,
+    /// Last message from the Playgrounds menu (which GUI was started).
+    launch_msg: Option<String>,
 }
 
 impl Default for Viewer {
@@ -66,6 +84,10 @@ impl Default for Viewer {
             layers: Layers::default(),
             view: MapView::default(),
             selected: None,
+            snapshot: None,
+            selected_task: None,
+            show_settings: false,
+            launch_msg: None,
         };
         viewer.regenerate();
         viewer
@@ -74,6 +96,8 @@ impl Default for Viewer {
 
 impl eframe::App for Viewer {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        egui::Panel::top("menu").show(ui, |ui| self.menu_bar(ui));
+
         egui::Panel::left("controls")
             .resizable(true)
             .default_size(290.0)
@@ -81,6 +105,7 @@ impl eframe::App for Viewer {
                 egui::ScrollArea::vertical().show(ui, |ui| self.controls(ui));
             });
 
+        self.settings_window(ui.ctx());
         self.regenerate();
 
         egui::Panel::right("details")
@@ -105,6 +130,27 @@ impl Viewer {
         );
         self.config.n_squads = self.config.n_squads.clamp(1, cells.max(1));
         self.config.squad_spread = self.config.squad_spread.max(0.05);
+        // Values that would make the simulator panic (empty random ranges, division by 0).
+        let c = &mut self.config;
+        c.squad_size = c.squad_size.max(1);
+        c.range_short = c.range_short.max(0.05);
+        c.range_long = c.range_long.max(0.05);
+        c.jam_d0 = c.jam_d0.max(0.05);
+        c.noise_sd = c.noise_sd.max(0.0);
+        c.noise_floor = c.noise_floor.max(1e-4);
+        c.task_near_radius = c.task_near_radius.max(0.05);
+        c.task_near_frac = c.task_near_frac.clamp(0.0, 1.0);
+        for s in [
+            &mut c.signal_scale_recon,
+            &mut c.signal_scale_rf,
+            &mut c.signal_scale_relay,
+            &mut c.signal_scale_compute,
+        ] {
+            *s = s.max(0.01);
+        }
+        if c.jam_frac_min > c.jam_frac_max {
+            std::mem::swap(&mut c.jam_frac_min, &mut c.jam_frac_max);
+        }
 
         let key = (self.seed, self.config);
         if self.generated_for == Some(key) {
@@ -114,15 +160,27 @@ impl Viewer {
         self.swarm = spawn_swarm(&self.config, &mut rng);
         self.graph = epsilon_graph(&self.swarm, &self.config);
         self.squads = squad_infos(&self.swarm);
+        self.snapshot = build_snapshot(&self.swarm, &self.graph, &self.config, &mut rng);
         self.generated_for = Some(key);
         if self.selected.is_some_and(|i| i >= self.swarm.len()) {
             self.selected = None;
+        }
+        let n_tasks = self.snapshot.as_ref().map_or(0, |s| s.tasks.len());
+        if self.selected_task.is_some_and(|k| k >= n_tasks) {
+            self.selected_task = None;
         }
     }
 
     /// Left panel: mission, scenario, layers, legend.
     fn controls(&mut self, ui: &mut egui::Ui) {
         ui.heading("AERIE viewer");
+        if ui
+            .button("⚙ All settings…")
+            .on_hover_text("Every SimConfig field in a window. Changes apply live.")
+            .clicked()
+        {
+            self.show_settings = true;
+        }
         ui.add_space(4.0);
 
         // Mission.
@@ -226,9 +284,33 @@ impl Viewer {
             &mut self.layers.dim_other_squads,
             "Dim other squads on select",
         );
-        ui.checkbox(&mut self.layers.links, "Links (ε-graph)")
+        ui.checkbox(
+            &mut self.layers.jamming,
+            "Jammer, ridge, jammed zone (step 2)",
+        )
+        .on_hover_text("Lime: drones in the jammed zone. Dashed ring: d0, half power.");
+        ui.add_enabled(
+            self.layers.jamming,
+            egui::Checkbox::new(&mut self.layers.zone_shade, "Shade the jammed zone"),
+        )
+        .on_hover_text(
+            "Dark fill where the true power is at or above the threshold, darker towards P0. \
+             The ridge shadow shows as a gap.",
+        );
+        ui.checkbox(&mut self.layers.links, "Links")
             .on_hover_text("Width = weight. Select a drone to highlight its links.");
         ui.add_enabled_ui(self.layers.links, |ui| {
+            egui::ComboBox::from_label("Links shown")
+                .selected_text(self.layers.link_source.label())
+                .show_ui(ui, |ui| {
+                    for s in LinkSource::ALL {
+                        ui.selectable_value(&mut self.layers.link_source, s, s.label());
+                    }
+                });
+            ui.add_enabled(
+                self.layers.link_source == LinkSource::Live,
+                egui::Checkbox::new(&mut self.layers.dead_links, "Dead links (red, dashed)"),
+            );
             egui::ComboBox::from_label("Link colour")
                 .selected_text(self.layers.link_color.label())
                 .show_ui(ui, |ui| {
@@ -237,6 +319,8 @@ impl Viewer {
                     }
                 });
         });
+        ui.checkbox(&mut self.layers.tasks, "Tasks (step 3a)")
+            .on_hover_text("Click a task to highlight the drones whose role can take it.");
         ui.horizontal(|ui| {
             if ui.button("Reset view").clicked() {
                 self.view = MapView::default();
@@ -285,6 +369,25 @@ impl Viewer {
                 });
             }
         }
+        if self.layers.jamming {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                swatch(ui, Role::Recon, JAMMED_DRONE_COLOR);
+                ui.label("In the jammed zone (lime, any squad)");
+            });
+        }
+        if self.layers.tasks {
+            ui.add_space(4.0);
+            ui.weak("Tasks (diamonds): filled = near a drone, hollow = uniform");
+            ui.horizontal_wrapped(|ui| {
+                for kind in TaskKind::ALL {
+                    ui.label(
+                        RichText::new(format!("◆ {} {}", task_letter(kind), task_name(kind)))
+                            .color(task_color(kind)),
+                    );
+                }
+            });
+        }
     }
 
     /// Centre: the map, with a banner for missions that have no view yet.
@@ -309,8 +412,257 @@ impl Viewer {
             &self.swarm,
             &self.graph,
             &self.squads,
+            self.snapshot.as_ref(),
             &mut self.selected,
+            &mut self.selected_task,
         );
+    }
+
+    /// Top bar: a Playgrounds menu that opens each GUI in its own window, and the settings.
+    fn menu_bar(&mut self, ui: &mut egui::Ui) {
+        egui::MenuBar::new().ui(ui, |ui| {
+            ui.menu_button("Playgrounds", |ui| {
+                ui.weak("Opens in a new window (built first if the code changed).");
+                for gui in &GUIS {
+                    if ui.button(gui.title).on_hover_text(gui.about).clicked() {
+                        self.launch_msg = Some(launch(gui.bin));
+                        ui.close();
+                    }
+                }
+            });
+            if ui.button("Settings").clicked() {
+                self.show_settings = true;
+            }
+            if let Some(msg) = &self.launch_msg {
+                ui.weak(msg);
+            }
+        });
+    }
+
+    /// The settings window: every `SimConfig` field, grouped. Each change rebuilds the seed
+    /// live (spawn, jamming, live graph, tasks), in the dataset order.
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_settings;
+        egui::Window::new("Settings (SimConfig)")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(420.0)
+            .vscroll(true)
+            .show(ctx, |ui| self.settings(ui));
+        self.show_settings = open;
+    }
+
+    fn settings(&mut self, ui: &mut egui::Ui) {
+        ui.weak("Changes apply live: the seed is rebuilt in the dataset order.");
+        // Live result of the current config.
+        match &self.snapshot {
+            Some(s) => {
+                let n = self.swarm.len().max(1);
+                let zone = s.labels.iter().filter(|&&l| l).count();
+                let live = stats(&s.live.graph, &self.swarm);
+                let lost =
+                    1.0 - s.live.graph.edges.len() as f64 / self.graph.edges.len().max(1) as f64;
+                ui.label(
+                    RichText::new(format!(
+                        "{} drones · {:.0} % jammed · {:.0} % links lost · degree {:.2} · \
+                         {} components · {} tasks",
+                        self.swarm.len(),
+                        100.0 * zone as f64 / n as f64,
+                        100.0 * lost,
+                        live.mean_degree,
+                        live.n_components,
+                        s.tasks.len()
+                    ))
+                    .monospace(),
+                );
+            }
+            None => {
+                ui.colored_label(
+                    egui::Color32::from_rgb(255, 120, 80),
+                    "place_jamming found no placement with these bounds: no jamming or tasks.",
+                );
+            }
+        }
+        ui.separator();
+
+        let d = SimConfig::default();
+        let cfg = &mut self.config;
+
+        egui::CollapsingHeader::new("Swarm and arena")
+            .default_open(true)
+            .show(ui, |ui| {
+                // The arena is a whole number of cells, so every cell size stays valid.
+                let mut cols = (cfg.arena_w / cfg.cell_width).round().max(1.0) as usize;
+                let mut rows = (cfg.arena_h / cfg.cell_height).round().max(1.0) as usize;
+                ui.add(
+                    egui::Slider::new(&mut cfg.cell_width, 1.0..=20.0)
+                        .step_by(0.5)
+                        .suffix(" km")
+                        .text("cell width"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut cfg.cell_height, 1.0..=20.0)
+                        .step_by(0.5)
+                        .suffix(" km")
+                        .text("cell height"),
+                );
+                ui.add(egui::Slider::new(&mut cols, 1..=20).text("cells across"));
+                ui.add(egui::Slider::new(&mut rows, 1..=20).text("cells down"));
+                cfg.arena_w = cols as f64 * cfg.cell_width;
+                cfg.arena_h = rows as f64 * cfg.cell_height;
+                ui.weak(format!(
+                    "Arena {} × {} km, {} cells (one squad per cell at most).",
+                    cfg.arena_w,
+                    cfg.arena_h,
+                    cols * rows
+                ));
+                ui.add(egui::Slider::new(&mut cfg.n_squads, 1..=(cols * rows)).text("squads"));
+                ui.add(egui::Slider::new(&mut cfg.squad_size, 1..=30).text("drones per squad"));
+                ui.add(
+                    egui::Slider::new(&mut cfg.squad_spread, 0.1..=6.0)
+                        .suffix(" km")
+                        .text("squad spread"),
+                );
+                if ui.small_button("Reset group").clicked() {
+                    cfg.arena_w = d.arena_w;
+                    cfg.arena_h = d.arena_h;
+                    cfg.cell_width = d.cell_width;
+                    cfg.cell_height = d.cell_height;
+                    cfg.n_squads = d.n_squads;
+                    cfg.squad_size = d.squad_size;
+                    cfg.squad_spread = d.squad_spread;
+                }
+            });
+
+        egui::CollapsingHeader::new("Radio ranges (D01)")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.add(
+                    egui::Slider::new(&mut cfg.range_short, 0.5..=15.0)
+                        .suffix(" km")
+                        .text("short range (recon, RF, compute)"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut cfg.range_long, 0.5..=30.0)
+                        .suffix(" km")
+                        .text("relay range"),
+                );
+                ui.add(egui::Slider::new(&mut cfg.knn_k, 1..=20).text("kNN k"))
+                    .on_hover_text("Used by knn_graph only; this viewer shows the ε-graph.");
+                if ui.small_button("Reset group").clicked() {
+                    cfg.range_short = d.range_short;
+                    cfg.range_long = d.range_long;
+                    cfg.knn_k = d.knn_k;
+                }
+            });
+
+        egui::CollapsingHeader::new("Jamming (D02)")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.add(egui::Slider::new(&mut cfg.jam_p0, 0.1..=3.0).text("P0  jammer power"));
+                ui.add(
+                    egui::Slider::new(&mut cfg.jam_d0, 0.5..=10.0)
+                        .suffix(" km")
+                        .text("d0  half-power distance"),
+                );
+                ui.add(egui::Slider::new(&mut cfg.ridge_factor, 0.0..=1.0).text("ridge factor"));
+                ui.add(
+                    egui::Slider::new(&mut cfg.jam_threshold, 0.05..=1.0)
+                        .text("zone threshold (× P0)"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut cfg.noise_sd, 0.0..=0.5).text("reading noise sd (× P0)"),
+                );
+                let before = (cfg.jam_frac_min, cfg.jam_frac_max);
+                ui.add(
+                    egui::Slider::new(&mut cfg.jam_frac_min, 0.0..=1.0)
+                        .custom_formatter(|v, _| format!("{:.0} %", v * 100.0))
+                        .text("min jammed share"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut cfg.jam_frac_max, 0.0..=1.0)
+                        .custom_formatter(|v, _| format!("{:.0} %", v * 100.0))
+                        .text("max jammed share"),
+                );
+                // Keep min <= max: whichever slider moved pushes the other one.
+                if cfg.jam_frac_min > cfg.jam_frac_max {
+                    if cfg.jam_frac_min != before.0 {
+                        cfg.jam_frac_max = cfg.jam_frac_min;
+                    } else {
+                        cfg.jam_frac_min = cfg.jam_frac_max;
+                    }
+                }
+                if ui.small_button("Reset group").clicked() {
+                    cfg.jam_p0 = d.jam_p0;
+                    cfg.jam_d0 = d.jam_d0;
+                    cfg.ridge_factor = d.ridge_factor;
+                    cfg.jam_threshold = d.jam_threshold;
+                    cfg.noise_sd = d.noise_sd;
+                    cfg.jam_frac_min = d.jam_frac_min;
+                    cfg.jam_frac_max = d.jam_frac_max;
+                }
+            });
+
+        egui::CollapsingHeader::new("Link model (D03)")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.add(
+                    egui::Slider::new(&mut cfg.noise_floor, 0.005..=5.0)
+                        .logarithmic(true)
+                        .text("N0  noise floor (× P0)"),
+                )
+                .on_hover_text("Lower N0 = FEWER links under jamming (tx power is tied to N0).");
+                for (name, value) in [
+                    ("recon scale", &mut cfg.signal_scale_recon),
+                    ("RF sensing scale", &mut cfg.signal_scale_rf),
+                    ("relay scale", &mut cfg.signal_scale_relay),
+                    ("compute scale", &mut cfg.signal_scale_compute),
+                ] {
+                    ui.add(
+                        egui::Slider::new(value, 0.05..=3.0)
+                            .logarithmic(true)
+                            .suffix(" km")
+                            .text(name),
+                    );
+                }
+                ui.weak("Smaller scale = louder transmitter = resists jamming.");
+                if ui.small_button("Reset group").clicked() {
+                    cfg.noise_floor = d.noise_floor;
+                    cfg.signal_scale_recon = d.signal_scale_recon;
+                    cfg.signal_scale_rf = d.signal_scale_rf;
+                    cfg.signal_scale_relay = d.signal_scale_relay;
+                    cfg.signal_scale_compute = d.signal_scale_compute;
+                }
+            });
+
+        egui::CollapsingHeader::new("Tasks (step 3a)")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.add(egui::Slider::new(&mut cfg.n_tasks, 0..=200).text("tasks"));
+                ui.add(
+                    egui::Slider::new(&mut cfg.task_near_frac, 0.0..=1.0)
+                        .custom_formatter(|v, _| format!("{:.0} %", v * 100.0))
+                        .text("placed near a drone"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut cfg.task_near_radius, 0.1..=10.0)
+                        .suffix(" km")
+                        .text("near radius"),
+                );
+                if ui.small_button("Reset group").clicked() {
+                    cfg.n_tasks = d.n_tasks;
+                    cfg.task_near_frac = d.task_near_frac;
+                    cfg.task_near_radius = d.task_near_radius;
+                }
+            });
+
+        ui.separator();
+        ui.horizontal(|ui| {
+            if ui.button("Reset everything to defaults").clicked() {
+                *cfg = d;
+            }
+            ui.weak("The seed is kept.");
+        });
     }
 
     /// Summary of the comm graph, from `swarmsim::graphs::stats::stats`.
@@ -377,6 +729,146 @@ impl Viewer {
         // Comm graph.
         ui.label(RichText::new("Links (ε-graph)").strong());
         self.link_stats(ui);
+        ui.separator();
+
+        // Jamming and the live graph.
+        ui.label(RichText::new("Jamming and live links (step 2)").strong());
+        match &self.snapshot {
+            None => {
+                ui.weak(
+                    "place_jamming found no placement for this config (5-30 % jammed). \
+                     Try another seed or reset the config.",
+                );
+            }
+            Some(s) => {
+                let n = self.swarm.len().max(1);
+                let zone = s.labels.iter().filter(|&&l| l).count();
+                let live = stats(&s.live.graph, &self.swarm);
+                let lost =
+                    1.0 - s.live.graph.edges.len() as f64 / self.graph.edges.len().max(1) as f64;
+                egui::Grid::new("jam_stats").striped(true).show(ui, |ui| {
+                    let mut row = |k: &str, v: String| {
+                        ui.label(k);
+                        ui.label(v);
+                        ui.end_row();
+                    };
+                    row(
+                        "Jammer",
+                        format!(
+                            "({:.1}, {:.1}) km",
+                            s.jammer.position.x, s.jammer.position.y
+                        ),
+                    );
+                    row(
+                        "In the jammed zone",
+                        format!("{zone} drones ({:.0} %)", 100.0 * zone as f64 / n as f64),
+                    );
+                    row(
+                        "Live links",
+                        format!("{} ({:.0} % lost)", live.n_edges, 100.0 * lost),
+                    );
+                    row("Mean degree", format!("{:.2}", live.mean_degree));
+                    row(
+                        "Components",
+                        format!(
+                            "{}  (largest {} of {})",
+                            live.n_components, live.largest_component, live.n_nodes
+                        ),
+                    );
+                    row("Isolated drones", live.isolated.to_string());
+                    row(
+                        "One-way",
+                        format!(
+                            "{} cut by jamming · {} by range",
+                            s.live.cut_one_way.len(),
+                            s.live.range_one_way.len()
+                        ),
+                    );
+                });
+            }
+        }
+        ui.separator();
+
+        // Tasks.
+        ui.label(RichText::new("Tasks (step 3a)").strong());
+        if let Some(s) = &self.snapshot {
+            let n_near = n_near_tasks(cfg);
+            egui::Grid::new("task_counts").striped(true).show(ui, |ui| {
+                ui.label("");
+                ui.label("Tasks");
+                ui.label("Near");
+                ui.label("Drones able");
+                ui.end_row();
+                for kind in TaskKind::ALL {
+                    let of_kind: Vec<usize> = (0..s.tasks.len())
+                        .filter(|&k| s.tasks[k].kind == kind)
+                        .collect();
+                    ui.label(RichText::new(task_name(kind)).color(task_color(kind)));
+                    ui.label(of_kind.len().to_string());
+                    ui.label(of_kind.iter().filter(|&&k| k < n_near).count().to_string());
+                    ui.label(
+                        self.swarm
+                            .iter()
+                            .filter(|d| kind.can_do(d.role))
+                            .count()
+                            .to_string(),
+                    );
+                    ui.end_row();
+                }
+            });
+            ui.weak("Drones able: by role only. The relay rule (3b) comes next.");
+            if let Some(task) = self.selected_task.and_then(|k| s.tasks.get(k)) {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(format!(
+                        "Selected: task {} · {}",
+                        task.id.0,
+                        task_name(task.kind)
+                    ))
+                    .color(task_color(task.kind))
+                    .strong(),
+                );
+                ui.label(format!(
+                    "({:.2}, {:.2}) km · {}",
+                    task.position.x,
+                    task.position.y,
+                    if (task.id.0 as usize) < n_near {
+                        "near a drone"
+                    } else {
+                        "uniform"
+                    }
+                ));
+                let mut able: Vec<(f64, usize)> = self
+                    .swarm
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, d)| task.kind.can_do(d.role))
+                    .map(|(i, d)| (d.position.dist(task.position), i))
+                    .collect();
+                able.sort_by(|a, b| a.0.total_cmp(&b.0));
+                ui.weak("Closest drones that can take it:");
+                for &(dist, i) in able.iter().take(5) {
+                    let d = &self.swarm[i];
+                    let text = format!(
+                        "drone {} · {} · S{} · {dist:.2} km · battery {:.2}",
+                        d.id.0,
+                        role_name(d.role),
+                        d.squad.0,
+                        d.battery
+                    );
+                    if ui.selectable_label(false, text).clicked() {
+                        self.selected = Some(i);
+                    }
+                }
+                if ui.button("Deselect task").clicked() {
+                    self.selected_task = None;
+                }
+            } else {
+                ui.weak("Click a task on the map.");
+            }
+        } else {
+            ui.weak("No snapshot for this config.");
+        }
         ui.separator();
 
         // Selected drone.
@@ -475,9 +967,119 @@ impl Viewer {
     }
 }
 
+/// Step 2 and 3a for one seed, continuing the RNG after `spawn_swarm` in the dataset
+/// order. `place_jamming` panics when no placement fits the bounds (possible with the
+/// sliders); that becomes `None` here, with the panic message silenced.
+fn build_snapshot(
+    swarm: &[Drone],
+    graph: &EdgeList,
+    cfg: &SimConfig,
+    rng: &mut ChaCha8Rng,
+) -> Option<Snapshot> {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let placed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        place_jamming(swarm, cfg, rng)
+    }));
+    std::panic::set_hook(previous);
+    let (jammer, ridge) = placed.ok()?;
+    let truth = true_power(swarm, &jammer, &ridge, cfg);
+    let reads = readings(&truth, cfg, rng);
+    let labels = jammed_labels(&truth, cfg);
+    let live = live_graph(graph, swarm, &truth, cfg);
+    let tasks = spawn_tasks(swarm, cfg, rng);
+    let field = jam_field(&jammer, &ridge, cfg);
+    Some(Snapshot {
+        jammer,
+        ridge,
+        truth,
+        readings: reads,
+        labels,
+        live,
+        tasks,
+        field,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_follows_the_dataset_order() {
+        let v = Viewer::default();
+        let s = v.snapshot.as_ref().expect("seed 0 places jamming");
+        let cfg = SimConfig::default();
+        let mut rng = ChaCha8Rng::seed_from_u64(0);
+        let swarm = spawn_swarm(&cfg, &mut rng);
+        let (jammer, ridge) = place_jamming(&swarm, &cfg, &mut rng);
+        let truth = true_power(&swarm, &jammer, &ridge, &cfg);
+        let reads = readings(&truth, &cfg, &mut rng);
+        let tasks = spawn_tasks(&swarm, &cfg, &mut rng);
+        assert_eq!(s.jammer, jammer);
+        assert_eq!(s.truth, truth);
+        assert_eq!(s.readings, reads);
+        assert_eq!(s.tasks, tasks);
+        assert_eq!(s.live, live_graph(&v.graph, &swarm, &truth, &cfg));
+        assert_eq!(s.labels, jammed_labels(&truth, &cfg));
+    }
+
+    #[test]
+    fn shading_field_covers_the_arena_and_matches_jam_power() {
+        let v = Viewer::default();
+        let s = v.snapshot.as_ref().unwrap();
+        let (w, h) = map::field_dims(&v.config);
+        assert_eq!(s.field.len(), w * h);
+        // The cell under the jammer is in the zone (power close to P0).
+        let c = (s.jammer.position.x / map::FIELD_RES) as usize;
+        let r = (s.jammer.position.y / map::FIELD_RES) as usize;
+        assert!(s.field[r * w + c] >= v.config.jam_threshold * v.config.jam_p0);
+        // Every value is the real jam_power at the cell centre.
+        let at = swarmsim::drone::Vec2 {
+            x: (c as f64 + 0.5) * map::FIELD_RES,
+            y: (r as f64 + 0.5) * map::FIELD_RES,
+        };
+        let expected = swarmsim::jamming::jam_power(&s.jammer, &s.ridge, at, &v.config);
+        assert_eq!(s.field[r * w + c], expected);
+    }
+
+    #[test]
+    fn settings_that_would_panic_are_guarded() {
+        // A zero task radius (empty random range), swapped share bounds, zero scales.
+        let mut v = Viewer::default();
+        v.config.task_near_radius = 0.0;
+        v.config.jam_frac_min = 0.3;
+        v.config.jam_frac_max = 0.05;
+        v.config.signal_scale_relay = 0.0;
+        v.config.squad_size = 0;
+        v.regenerate();
+        assert!(v.config.task_near_radius > 0.0);
+        assert!(v.config.jam_frac_min <= v.config.jam_frac_max);
+        assert!(v.config.signal_scale_relay > 0.0);
+        assert!(v.snapshot.is_some());
+        // A different arena (8 x 3 cells of 5 km) still spawns and places jamming.
+        v.config = SimConfig {
+            arena_w: 40.0,
+            arena_h: 15.0,
+            n_squads: 6,
+            ..SimConfig::default()
+        };
+        v.regenerate();
+        assert_eq!(v.swarm.len(), 60);
+        assert!(v.snapshot.is_some());
+    }
+
+    #[test]
+    fn impossible_jamming_bounds_give_no_snapshot_instead_of_a_crash() {
+        let mut v = Viewer::default();
+        v.config.jam_frac_min = 1.0;
+        v.config.jam_frac_max = 1.0;
+        v.selected_task = Some(3);
+        v.regenerate();
+        assert!(v.snapshot.is_none());
+        assert_eq!(v.selected_task, None);
+        assert_eq!(v.swarm.len(), 100); // the swarm itself is still shown
+    }
 
     #[test]
     fn viewer_starts_and_regenerates_on_change() {

@@ -76,9 +76,34 @@ Always use `--release` for the GUIs: they are much smoother.
 
 ### Swarm viewer
 
-Shows a whole spawned swarm: squads, roles, grid cells and the comm graph (ε-graph).
+Shows a whole spawned swarm: squads, roles, grid cells and the comm graph (ε-graph). Each seed
+is built in the dataset order with one RNG: `spawn_swarm`, `place_jamming`, `true_power`,
+`readings`, `live_graph`, `spawn_tasks`, so the viewer shows exactly what the dataset holds.
+
+- **Jammer, ridge, jammed zone (step 2):** the jammer (red disc), its d0 ring (dashed), the
+  ridge (brown), and every drone in the jammed zone drawn in **lime** (a colour no squad, role
+  or task uses). *Shade the jammed zone* fills the zone in a dark tint, darker where the jamming
+  is stronger; it follows `jam_power`, so the ridge shadow shows as a gap.
+- **Links shown:** *Geometric* (`epsilon_graph`, as if there were no jammer) or *Live*
+  (`live_graph`, after jamming, the default). With live links, the geometric links that
+  jamming killed are drawn red and dashed.
+- **Tasks (step 3a):** 50 diamonds coloured by kind (O observe, T track, R relay, F fuse).
+  Filled = placed near a drone, hollow = uniform. Hover a task for its roles, the number of
+  drones that can take it and the nearest one. Click a task: drones whose role can take it get
+  a ring in its colour, the others fade. The right panel counts tasks per kind and lists the
+  5 closest drones able to take the selected task (click one to select it).
 
 - **Left panel:** mission, seed (◀ ▶ to step), cell size, squad count and size, spread, radio ranges, layers, legend.
+- **Menu bar:** *Playgrounds* opens any GUI (graph playground, jamming playground, another swarm
+  viewer) in its own window. It runs `cargo run --release` for it, so you always get the latest
+  code; the first time it builds for a few seconds. *Settings* opens the settings window.
+- **Red dashed lines:** between drones, a dead link (in range on a quiet day, killed by jamming:
+  neither direction gets through). Around the jammer, the d0 ring (half power).
+- **⚙ All settings…** (top of the left panel, or *Settings* in the menu bar): a window with every `SimConfig` field, in groups
+  (swarm and arena, radio ranges, jamming, link model, tasks), each with *Reset group*, plus
+  *Reset everything*. Changes apply live, and a line at the top shows the result: jammed share,
+  links lost, mean degree, components, tasks. The arena is set in whole cells so every cell size
+  stays valid. Values that would crash the simulator (a zero radius, swapped bounds) are guarded.
 - **Links layer:** width = weight; colour by weight, or by inside / between squads
   (links between squads stand out). Select a drone to highlight its links.
 - **Map:** scroll to zoom, drag to pan, click a drone to select it, hover for details.
