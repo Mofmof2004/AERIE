@@ -2,6 +2,7 @@
 //! by repeatedly averaging their neighbours, Y <- P Y, with the known rows clamped.
 
 use faer::Mat;
+use faer::linalg::solvers::Solve;
 
 /// Label propagation: spreads the known labels over the graph until nothing moves.
 ///
@@ -75,6 +76,57 @@ pub fn label_propagation(
     }
 
     (y, iteration_count)
+}
+
+/// Label propagation in one linear solve: the answer `label_propagation` converges to.
+///
+/// At convergence the silent rows satisfy Y_U = P_UU Y_U + P_UL Y_L, so
+/// (I - P_UU) Y_U = P_UL Y_L. Instead of cutting out the blocks, this keeps all n rows
+/// in their drone order and solves one n x n system M Y = B:
+/// - labelled drone i: M row = identity row, B row = its one-hot (so Y_i is its label);
+/// - silent drone i: M[i][j] = delta_ij - P[i][j] over silent j (0 over labelled j),
+///   B row = sum over labelled j of P[i][j] times j's one-hot.
+///
+/// Solved with an LU factorization (`partial_piv_lu().solve`), never forming an inverse.
+///
+/// Not handled yet: a silent drone with no path to any labelled drone (isolated, or a
+/// silent squad cut off from every report) makes M singular, and its row comes out as
+/// inf or NaN. The iterative version gives it zeros.
+pub fn label_propagation_closed_form(
+    p: &Mat<f64>,
+    labels: &[Option<usize>],
+    n_classes: usize,
+) -> Mat<f64> {
+    let n = p.nrows();
+    let mut index_matrix: Mat<f64> = Mat::zeros(n, n);
+    for i in 0..n {
+        index_matrix[(i, i)] = 1.0;
+    }
+
+    let mut y: Mat<f64> = Mat::zeros(n, n_classes);
+
+    for i in 0..labels.len() {
+        if let Some(c) = labels[i] {
+            y[(i, c)] = 1.0;
+        }
+    }
+
+    let mut new_y: Mat<f64> = y.clone();
+    for i in 0..n {
+        if labels[i].is_none() {
+            for j in 0..n {
+                if labels[j].is_none() {
+                    index_matrix[(i, j)] -= p[(i, j)];
+                } else {
+                    for class in 0..n_classes {
+                        new_y[(i, class)] += p[(i, j)] * y[(j, class)];
+                    }
+                }
+            }
+        }
+    }
+
+    index_matrix.partial_piv_lu().solve(&new_y) // gives Y such that M · Y = B
 }
 
 #[cfg(test)]
@@ -165,6 +217,99 @@ mod tests {
         assert!(close(&row(&y, 1), &[0.0, 1.0], 1e-12));
         assert_eq!(row(&y, 2), [0.0, 0.0]);
         assert_eq!(row(&y, 3), [1.0, 0.0]);
+    }
+
+    /// Largest difference between two matrices of the same size.
+    fn max_diff(a: &Mat<f64>, b: &Mat<f64>) -> f64 {
+        assert_eq!((a.nrows(), a.ncols()), (b.nrows(), b.ncols()));
+        let mut d = 0.0_f64;
+        for i in 0..a.nrows() {
+            for j in 0..a.ncols() {
+                d = d.max((a[(i, j)] - b[(i, j)]).abs());
+            }
+        }
+        d
+    }
+
+    #[test]
+    fn closed_form_path_of_three() {
+        // One solve gives what the iteration reaches after 2 rounds.
+        let y = label_propagation_closed_form(&path(3), &[Some(0), None, Some(1)], 2);
+        assert!(close(&row(&y, 0), &[1.0, 0.0], 1e-12));
+        assert!(close(&row(&y, 1), &[0.5, 0.5], 1e-12));
+        assert!(close(&row(&y, 2), &[0.0, 1.0], 1e-12));
+    }
+
+    #[test]
+    fn closed_form_path_of_five_is_exact() {
+        // The iteration only gets close to 0.75 / 0.5 / 0.25; the solve hits it.
+        let labels = [Some(0), None, None, None, Some(1)];
+        let y = label_propagation_closed_form(&path(5), &labels, 2);
+        assert!(close(&row(&y, 1), &[0.75, 0.25], 1e-12));
+        assert!(close(&row(&y, 2), &[0.5, 0.5], 1e-12));
+        assert!(close(&row(&y, 3), &[0.25, 0.75], 1e-12));
+    }
+
+    #[test]
+    fn closed_form_matches_the_iteration() {
+        // Weighted graphs where every silent drone can reach a label: the iteration with
+        // a tight tolerance and the solve agree to 1e-6.
+        let cases: Vec<(Mat<f64>, Vec<Option<usize>>, usize)> = vec![
+            (
+                p_of(3, &[(0, 1, 3.0), (1, 2, 1.0)]),
+                vec![Some(0), None, Some(1)],
+                2,
+            ),
+            (
+                path(6),
+                vec![Some(0), None, Some(2), None, None, Some(1)],
+                3,
+            ),
+            (
+                // A triangle with a tail and a chord, uneven weights, labels at both ends.
+                p_of(
+                    6,
+                    &[
+                        (0, 1, 1.0),
+                        (1, 2, 0.4),
+                        (0, 2, 2.0),
+                        (2, 3, 0.7),
+                        (3, 4, 1.5),
+                        (4, 5, 0.2),
+                        (1, 4, 0.9),
+                    ],
+                ),
+                vec![Some(1), None, None, None, None, Some(0)],
+                2,
+            ),
+        ];
+        for (k, (p, labels, c)) in cases.iter().enumerate() {
+            let (iterated, _) = label_propagation(p, labels, *c, 1e-12, 100_000);
+            let solved = label_propagation_closed_form(p, labels, *c);
+            let d = max_diff(&iterated, &solved);
+            assert!(d < 1e-6, "case {k}: differ by {d}");
+        }
+    }
+
+    #[test]
+    fn closed_form_keeps_the_labelled_rows() {
+        let labels = [Some(0), None, Some(1), None, Some(0)];
+        let y = label_propagation_closed_form(&path(5), &labels, 2);
+        assert_eq!(row(&y, 0), [1.0, 0.0]);
+        assert_eq!(row(&y, 2), [0.0, 1.0]);
+        assert_eq!(row(&y, 4), [1.0, 0.0]);
+    }
+
+    #[test]
+    #[ignore = "next step: silent drones with no path to a label make M singular"]
+    fn closed_form_gives_zeros_where_no_label_can_reach() {
+        // Same answer as the iteration: drone 2 is isolated and silent, so its row is
+        // zero. Today the solve returns inf or NaN there.
+        let p = p_of(4, &[(0, 1, 1.0)]);
+        let labels = [Some(1), None, None, Some(0)];
+        let y = label_propagation_closed_form(&p, &labels, 2);
+        assert_eq!(row(&y, 2), [0.0, 0.0]);
+        assert!(close(&row(&y, 1), &[0.0, 1.0], 1e-12));
     }
 
     #[test]
