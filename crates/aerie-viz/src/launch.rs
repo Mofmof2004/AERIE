@@ -13,7 +13,7 @@ pub struct Gui {
 }
 
 /// Every GUI, in menu order.
-pub const GUIS: [Gui; 4] = [
+pub const GUIS: [Gui; 5] = [
     Gui {
         bin: "swarm_viewer",
         title: "Swarm viewer",
@@ -33,6 +33,11 @@ pub const GUIS: [Gui; 4] = [
         bin: "matrix_playground",
         title: "Matrix playground",
         about: "Place drones and see A, D, A² and P = D⁻¹A of their comm graph (Mission 1).",
+    },
+    Gui {
+        bin: "lp_playground",
+        title: "Label propagation playground",
+        about: "Choose who reports, watch the labels spread round by round (Mission 1).",
     },
 ];
 

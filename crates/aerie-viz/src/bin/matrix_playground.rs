@@ -7,7 +7,7 @@
 //! shows the matrices of that graph, from the real functions in `aerie-graph`:
 //! - A, `EdgeList::adjacency_matrix`, optionally binary (every weight 1);
 //! - D, `EdgeList::degree_matrix`;
-//! - A² = A × A (optional): with a binary A, the number of 2-hop walks between drones;
+//! - A^k = A × … × A (optional, k chosen): with a binary A, the number of k-hop walks;
 //! - P = D⁻¹A, the transition matrix (shown once `EdgeList::transition_matrix` exists).
 //!
 //! Canvas: click empty space to add a drone, drag a drone to move it, right-click a drone
@@ -15,9 +15,10 @@
 //! Hover a matrix cell to see its link on the map; hover or select a drone to see its row.
 
 use aerie_graph::EdgeList;
+use aerie_viz::grid::{Focus, HOVER_COLOR, fmt, matrix_grid, show_tip};
 use aerie_viz::style::{draw_drone, role_color, role_name, swatch};
 use eframe::egui::{
-    self, Align2, Color32, FontId, Key, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, pos2, vec2,
+    self, Align2, Color32, FontId, Key, Pos2, Rect, RichText, Sense, Stroke, pos2, vec2,
 };
 use faer::Mat;
 use swarmsim::config::SimConfig;
@@ -31,20 +32,12 @@ const WORLD_H: f64 = 10.0;
 const GRAB_PX: f32 = 12.0;
 /// Drone marker radius, pixels.
 const NODE_PX: f32 = 8.0;
-/// Matrix cell size and header size, pixels.
-const CELL_W: f32 = 42.0;
-const CELL_H: f32 = 20.0;
-const HEAD: f32 = 22.0;
-/// Width of the row-sum column, pixels.
-const SUM_W: f32 = 48.0;
 
 /// Accent colours of the matrices.
 const A_COLOR: Color32 = Color32::from_rgb(78, 121, 167);
 const D_COLOR: Color32 = Color32::from_rgb(242, 142, 43);
 const A2_COLOR: Color32 = Color32::from_rgb(176, 122, 161);
 const P_COLOR: Color32 = Color32::from_rgb(89, 161, 79);
-/// Highlight of the hovered cell's link on the map.
-const HOVER_COLOR: Color32 = Color32::from_rgb(255, 200, 40);
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -72,8 +65,10 @@ struct Playground {
     config: SimConfig,
     /// Every link gets weight 1, so A is 0/1.
     binary: bool,
-    /// Show A² = A × A.
-    show_a2: bool,
+    /// Show A^k.
+    show_power: bool,
+    /// The power k of A^k.
+    power_k: usize,
 
     // Editing.
     new_role: Role,
@@ -101,7 +96,8 @@ impl Default for Playground {
             nodes: Vec::new(),
             config: SimConfig::default(),
             binary: false,
-            show_a2: false,
+            show_power: false,
+            power_k: 2,
             new_role: Role::Recon,
             snap: true,
             selected: None,
@@ -287,11 +283,18 @@ impl Playground {
                 "Every link gets weight 1. A then only says who is linked, D counts \
                  neighbours, and P spreads evenly over them.",
             );
-        ui.checkbox(&mut self.show_a2, "Show A² = A × A")
-            .on_hover_text(
-                "With a 0/1 A, (A²)[i][j] counts the walks of 2 hops from i to j. \
-                 The diagonal is the number of neighbours.",
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.show_power, "Show A^k, k =")
+                .on_hover_text(
+                    "With a 0/1 A, (A^k)[i][j] counts the walks of k hops from i to j. \
+                     A walk may go back and forth, so k = 2 puts each drone's number \
+                     of neighbours on the diagonal.",
+                );
+            ui.add_enabled(
+                self.show_power,
+                egui::DragValue::new(&mut self.power_k).range(1..=8),
             );
+        });
 
         ui.separator();
         ui.label(RichText::new("Links (D00 rule)").strong());
@@ -358,7 +361,18 @@ impl Playground {
         if n > 20 {
             ui.weak("Many drones: scroll the panel to see the whole matrices.");
         }
-        let roles: Vec<Role> = self.nodes.iter().map(|d| d.role).collect();
+        // Row and column headers: the drone number in its role colour.
+        let heads: Vec<(String, Color32)> = self
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(k, d)| (k.to_string(), role_color(d.role)))
+            .collect();
+        let at = |cell| Focus {
+            row: focus,
+            col: focus,
+            cell,
+        };
         let a = graph.adjacency_matrix();
         let d = graph.degree_matrix();
         let dist = |i: usize, j: usize| self.nodes[i].position.dist(self.nodes[j].position);
@@ -371,7 +385,15 @@ impl Playground {
         } else {
             "A[i][j] = weight of the link i–j, 0 when there is none."
         });
-        let (h, resp) = matrix_grid(ui, &a, &roles, focus, prev_hover, A_COLOR, "Σ = deg");
+        let (h, resp) = matrix_grid(
+            ui,
+            &a,
+            &heads,
+            &heads,
+            at(prev_hover),
+            A_COLOR,
+            Some("Σ = deg"),
+        );
         if let Some((i, j)) = h {
             hovered = Some((i, j));
             let text = if i == j {
@@ -392,7 +414,7 @@ impl Playground {
         ui.add_space(8.0);
         ui.label(RichText::new("D · degree").strong().color(D_COLOR));
         ui.weak("Diagonal: D[i][i] = sum of row i of A. Zero everywhere else.");
-        let (h, resp) = matrix_grid(ui, &d, &roles, focus, prev_hover, D_COLOR, "Σ");
+        let (h, resp) = matrix_grid(ui, &d, &heads, &heads, at(prev_hover), D_COLOR, Some("Σ"));
         if let Some((i, j)) = h {
             hovered = Some((i, j));
             let text = if i == j {
@@ -415,30 +437,49 @@ impl Playground {
             show_tip(resp, &text);
         }
 
-        // A².
-        if self.show_a2 {
-            let a2 = &a * &a;
+        // A^k.
+        if self.show_power {
+            let k = self.power_k;
+            let ak = mat_power(&a, k);
             ui.add_space(8.0);
-            ui.label(RichText::new("A² = A × A").strong().color(A2_COLOR));
+            ui.label(
+                RichText::new(format!("A^{k} = A × … × A ({k} times)"))
+                    .strong()
+                    .color(A2_COLOR),
+            );
             ui.weak(if self.binary {
-                "(A²)[i][j] = number of 2-hop walks i → k → j. Diagonal = neighbours of i."
+                format!(
+                    "(A^{k})[i][j] = number of {k}-hop walks from i to j. Non-zero = j is \
+                     reachable from i in exactly {k} hops (walks may go back and forth)."
+                )
             } else {
-                "(A²)[i][j] = Σₖ A[i][k]·A[k][j]: 2-hop walks, each weighted by its two links."
+                format!(
+                    "(A^{k})[i][j] = sum over {k}-hop walks i → … → j of the product of \
+                     their link weights."
+                )
             });
-            let (h, resp) = matrix_grid(ui, &a2, &roles, focus, prev_hover, A2_COLOR, "Σ");
+            let (h, resp) =
+                matrix_grid(ui, &ak, &heads, &heads, at(prev_hover), A2_COLOR, Some("Σ"));
             if let Some((i, j)) = h {
                 hovered = Some((i, j));
-                let via: Vec<String> = (0..n)
-                    .filter(|&k| a[(i, k)] != 0.0 && a[(k, j)] != 0.0)
-                    .map(|k| format!("{i}→{k}→{j}"))
-                    .collect();
-                let text = if via.is_empty() {
-                    format!("(A²)[{i}][{j}] = 0: no 2-hop walk from {i} to {j}.")
+                let (walks, more) = walks_between(&a, i, j, k, 6);
+                let text = if walks.is_empty() {
+                    format!("(A^{k})[{i}][{j}] = 0: no {k}-hop walk from {i} to {j}.")
                 } else {
+                    let list: Vec<String> = walks
+                        .iter()
+                        .map(|w| {
+                            w.iter()
+                                .map(|v| v.to_string())
+                                .collect::<Vec<_>>()
+                                .join("→")
+                        })
+                        .collect();
                     format!(
-                        "(A²)[{i}][{j}] = {}: walks {}",
-                        fmt(a2[(i, j)]),
-                        via.join(", ")
+                        "(A^{k})[{i}][{j}] = {}: walks {}{}",
+                        fmt(ak[(i, j)]),
+                        list.join(", "),
+                        if more { ", …" } else { "" }
                     )
                 };
                 show_tip(resp, &text);
@@ -455,7 +496,15 @@ impl Playground {
         match transition(graph) {
             Some(p) => {
                 ui.weak("P[i][j] = A[i][j] / D[i][i]: chance a random walk at i steps to j.");
-                let (h, resp) = matrix_grid(ui, &p, &roles, focus, prev_hover, P_COLOR, "Σ = 1?");
+                let (h, resp) = matrix_grid(
+                    ui,
+                    &p,
+                    &heads,
+                    &heads,
+                    at(prev_hover),
+                    P_COLOR,
+                    Some("Σ = 1?"),
+                );
                 if let Some((i, j)) = h {
                     hovered = Some((i, j));
                     let text = if d[(i, i)] == 0.0 {
@@ -730,159 +779,68 @@ impl Playground {
     }
 }
 
-/// Draws matrix `m` as a grid with row and column headers (coloured by role) and a
-/// row-sum column. Rows and columns of `focus` are outlined, the `hover` cell too.
-/// Returns the cell under the pointer, and the grid's response (for the tooltip).
-fn matrix_grid(
-    ui: &mut egui::Ui,
-    m: &Mat<f64>,
-    roles: &[Role],
-    focus: Option<usize>,
-    hover: Option<(usize, usize)>,
-    accent: Color32,
-    sum_label: &str,
-) -> (Option<(usize, usize)>, egui::Response) {
-    let n = m.nrows();
-    let size = vec2(
-        HEAD + n as f32 * CELL_W + 6.0 + SUM_W,
-        HEAD + n as f32 * CELL_H,
-    );
-    let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
-    let painter = ui.painter_at(rect);
-    let visuals = ui.visuals();
-    let bg = visuals.extreme_bg_color;
-    let text = visuals.strong_text_color();
-    let weak = visuals.weak_text_color();
-    let origin = rect.min + vec2(HEAD, HEAD);
-    let cell_rect = |i: usize, j: usize| {
-        Rect::from_min_size(
-            origin + vec2(j as f32 * CELL_W, i as f32 * CELL_H),
-            vec2(CELL_W, CELL_H),
-        )
+/// A^k by repeated multiplication (A^1 = A, A^0 = identity).
+fn mat_power(a: &Mat<f64>, k: usize) -> Mat<f64> {
+    let n = a.nrows();
+    let mut result: Mat<f64> = Mat::identity(n, n);
+    for _ in 0..k {
+        result = &result * a;
+    }
+    result
+}
+
+/// Up to `limit` walks of exactly `k` hops from `i` to `j` on the links of `a`, and
+/// whether there are more. Each walk lists its drones, `i` first, `j` last.
+fn walks_between(
+    a: &Mat<f64>,
+    i: usize,
+    j: usize,
+    k: usize,
+    limit: usize,
+) -> (Vec<Vec<usize>>, bool) {
+    struct Search<'m> {
+        a: &'m Mat<f64>,
+        j: usize,
+        limit: usize,
+        out: Vec<Vec<usize>>,
+        more: bool,
+    }
+    fn go(s: &mut Search, walk: &mut Vec<usize>, left: usize) {
+        let at = *walk.last().unwrap();
+        if left == 0 {
+            if at == s.j {
+                if s.out.len() < s.limit {
+                    s.out.push(walk.clone());
+                } else {
+                    s.more = true;
+                }
+            }
+            return;
+        }
+        for next in 0..s.a.nrows() {
+            if s.more {
+                return;
+            }
+            if s.a[(at, next)] != 0.0 {
+                walk.push(next);
+                go(s, walk, left - 1);
+                walk.pop();
+            }
+        }
+    }
+    let mut search = Search {
+        a,
+        j,
+        limit,
+        out: Vec::new(),
+        more: false,
     };
-    let max = (0..n)
-        .flat_map(|i| (0..n).map(move |j| m[(i, j)].abs()))
-        .fold(0.0_f64, f64::max)
-        .max(1e-12);
-
-    // Headers.
-    for (k, &role) in roles.iter().enumerate().take(n) {
-        let color = role_color(role);
-        painter.text(
-            pos2(
-                origin.x + (k as f32 + 0.5) * CELL_W,
-                rect.min.y + HEAD / 2.0,
-            ),
-            Align2::CENTER_CENTER,
-            format!("{k}"),
-            FontId::proportional(12.0),
-            color,
-        );
-        painter.text(
-            pos2(
-                rect.min.x + HEAD / 2.0,
-                origin.y + (k as f32 + 0.5) * CELL_H,
-            ),
-            Align2::CENTER_CENTER,
-            format!("{k}"),
-            FontId::proportional(12.0),
-            color,
-        );
-    }
-    let sum_x = origin.x + n as f32 * CELL_W + 6.0;
-    painter.text(
-        pos2(sum_x + SUM_W / 2.0, rect.min.y + HEAD / 2.0),
-        Align2::CENTER_CENTER,
-        sum_label,
-        FontId::proportional(11.0),
-        weak,
-    );
-
-    // Cells.
-    for i in 0..n {
-        for j in 0..n {
-            let r = cell_rect(i, j);
-            let v = m[(i, j)];
-            let fill = if v == 0.0 {
-                bg
-            } else {
-                mix(bg, accent, 0.25 + 0.65 * (v.abs() / max) as f32)
-            };
-            painter.rect_filled(r.shrink(0.5), 2.0, fill);
-            let label = if v == 0.0 { "·".to_string() } else { fmt(v) };
-            painter.text(
-                r.center(),
-                Align2::CENTER_CENTER,
-                label,
-                FontId::monospace(11.0),
-                if v == 0.0 { weak } else { text },
-            );
-        }
-        // Row sum.
-        let s: f64 = (0..n).map(|j| m[(i, j)]).sum();
-        painter.text(
-            pos2(sum_x + SUM_W / 2.0, origin.y + (i as f32 + 0.5) * CELL_H),
-            Align2::CENTER_CENTER,
-            fmt(s),
-            FontId::monospace(11.0),
-            weak,
-        );
-    }
-
-    // Outlines: the focused drone's row and column, then the hovered cell.
-    if let Some(f) = focus.filter(|&f| f < n) {
-        let stroke = Stroke::new(1.5, HOVER_COLOR.gamma_multiply(0.7));
-        let row = cell_rect(f, 0).union(cell_rect(f, n - 1));
-        let col = cell_rect(0, f).union(cell_rect(n - 1, f));
-        painter.rect_stroke(row, 2.0, stroke, StrokeKind::Inside);
-        painter.rect_stroke(col, 2.0, stroke, StrokeKind::Inside);
-    }
-    if let Some((i, j)) = hover.filter(|&(i, j)| i < n && j < n) {
-        painter.rect_stroke(
-            cell_rect(i, j),
-            2.0,
-            Stroke::new(2.0, HOVER_COLOR),
-            StrokeKind::Inside,
-        );
-    }
-
-    let cell = response.hover_pos().and_then(|p| {
-        let local = p - origin;
-        if local.x < 0.0 || local.y < 0.0 {
-            return None;
-        }
-        let (j, i) = ((local.x / CELL_W) as usize, (local.y / CELL_H) as usize);
-        (i < n && j < n).then_some((i, j))
-    });
-    (cell, response)
-}
-
-/// A tooltip at the pointer with one line of text.
-fn show_tip(response: egui::Response, text: &str) {
-    response.on_hover_ui_at_pointer(|ui| {
-        ui.label(text);
-    });
-}
-
-/// Short number: whole numbers without decimals, others with 2 (or 3 when small).
-fn fmt(v: f64) -> String {
-    if v == v.round() && v.abs() < 1e6 {
-        format!("{v:.0}")
-    } else if v.abs() < 0.1 {
-        format!("{v:.3}")
-    } else {
-        format!("{v:.2}")
-    }
+    go(&mut search, &mut vec![i], k);
+    (search.out, search.more)
 }
 
 fn yes(ok: bool) -> &'static str {
     if ok { "yes" } else { "NO" }
-}
-
-/// Linear mix of two colours, `t` = 0 gives `a`, 1 gives `b`.
-fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
-    let f = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
-    Color32::from_rgb(f(a.r(), b.r()), f(a.g(), b.g()), f(a.b(), b.b()))
 }
 
 /// km to screen and back. The world is fitted into the panel, y pointing up.
@@ -1037,9 +995,28 @@ mod tests {
     }
 
     #[test]
-    fn fmt_is_short() {
-        assert_eq!(fmt(1.0), "1");
-        assert_eq!(fmt(0.5), "0.50");
-        assert_eq!(fmt(0.04), "0.040");
+    fn a_to_the_k_counts_k_hop_walks() {
+        // Path 0-1-2-3, binary. A^3[0][3] = 1 (0→1→2→3); A^1 = A; A^0 = I.
+        let mut p = Playground {
+            binary: true,
+            ..Default::default()
+        };
+        p.load_path();
+        let a = p.graph().adjacency_matrix();
+        assert_eq!(mat_power(&a, 1)[(0, 1)], 1.0);
+        assert_eq!(mat_power(&a, 0)[(2, 2)], 1.0);
+        assert_eq!(mat_power(&a, 3)[(0, 3)], 1.0);
+        // The walk lister finds the same number as the matrix, cell by cell.
+        for k in 1..=4 {
+            let ak = mat_power(&a, k);
+            for i in 0..4 {
+                for j in 0..4 {
+                    let (walks, more) = walks_between(&a, i, j, k, 100);
+                    assert!(!more);
+                    assert_eq!(walks.len() as f64, ak[(i, j)], "k {k} ({i}, {j})");
+                }
+            }
+        }
+        assert_eq!(walks_between(&a, 0, 3, 3, 10).0, vec![vec![0, 1, 2, 3]]);
     }
 }

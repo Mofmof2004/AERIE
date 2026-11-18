@@ -152,6 +152,7 @@ dependencies = [
 name = "aerie-viz"
 version = "0.1.0"
 dependencies = [
+ "aerie-classic",
  "aerie-graph",
  "eframe",
  "faer",

@@ -28,7 +28,7 @@ AERIE/
 │   │           ├── knn/       knn_graph (union rule), tests
 │   │           └── stats.rs   stats(): mean degree, components, cross-squad share
 │   └── aerie-viz/          GUIs (egui): one binary per GUI in src/bin/
-│       └── src/bin/        swarm_viewer.rs, graph_playground.rs, jamming_playground.rs, matrix_playground.rs
+│       └── src/bin/        swarm_viewer.rs, graph_playground.rs, jamming_playground.rs, matrix_playground.rs, lp_playground.rs
 └── target/                 build output (not committed)
 ```
 
@@ -75,6 +75,7 @@ Always use `--release` for the GUIs: they are much smoother.
 | Graph playground | `cargo run --release -p aerie-viz --bin graph_playground` |
 | Jamming playground | `cargo run --release -p aerie-viz --bin jamming_playground` |
 | Matrix playground | `cargo run --release -p aerie-viz --bin matrix_playground` |
+| Label propagation playground | `cargo run --release -p aerie-viz --bin lp_playground` |
 
 ### Swarm viewer
 
@@ -174,7 +175,7 @@ Mission 1: place drones by hand and see the matrices of their comm graph next to
 Links follow the swarm rule (`epsilon_graph`, D00) with Gaussian weights; the matrices come
 from the real functions in `aerie-graph`.
 
-- **A** (`adjacency_matrix`), **D** (`degree_matrix`), optional **A² = A × A** (2-hop walks),
+- **A** (`adjacency_matrix`), **D** (`degree_matrix`), optional **A^k** with k from 1 to 8 (k-hop walks),
   and **P = D⁻¹A** (`transition_matrix`). Each grid has a Σ column with the row sums, and a
   check that every row of P sums to 1.
 - **A is 0/1:** tick to give every link weight 1, so A only says who is linked. With the
@@ -184,6 +185,31 @@ from the real functions in `aerie-graph`.
 - Canvas: click to add a drone (role in the left panel), drag to move, right-click or Delete
   to remove. Presets: triangle + isolated, path of 4, star around a relay, two squads joined
   by their relays. Sliders for the two radio ranges.
+
+### Label propagation playground
+
+Mission 1: choose which drones report their class and watch label propagation
+(`aerie_classic::lp::label_propagation`) spread it over the comm graph.
+
+- **Drones:** each has a true class. Reporting drones (thick ring, **R**) are the labelled
+  rows; silent drones are filled with the class colours mixed by their row of Y, with a small
+  bar of Y under them, and an outer ring in their true class. Grey with **?** = no label has
+  reached it yet.
+- **Rounds:** slider, ◀ ▶, Play (speed in rounds per second), ⏭ for the converged answer. The
+  map and the table show Y after that round; a log plot shows the largest change per round
+  against `tol`.
+- **Brush:** *Class k, reports*, *Class k, silent*, or *Switch reports / silent*. Click a drone
+  to paint it, click empty space for a new drone, drag to move, right-click to remove. 2 to 4
+  classes.
+- **Right panel:** accuracy on the silent drones (right, wrong, no guess) and every row of Y
+  with its guess and truth. Hover a row to find the drone.
+- **Matrices tab:** P = D⁻¹A, **P′** (P with each reporter's row replaced by an identity row:
+  that is the clamping), and Y before and after the shown round. Hover a cell of Y(t) to see
+  `Σⱼ P′[i][j] · Y(t−1)[j][c]` with the numbers; the row of P′ and the column of Y(t−1) that
+  go into it light up.
+- **Presets:** two sides joined by a bridge, path of 5, **the silent squad** (experiment 4:
+  a squad with no reporter takes its neighbour's class), random drones split west/east with a
+  chosen share reporting.
 
 ### Jamming playground
 
