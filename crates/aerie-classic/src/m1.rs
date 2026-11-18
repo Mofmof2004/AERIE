@@ -27,7 +27,7 @@ pub const MAIN_SHARE: f64 = 0.1;
 /// Random draws of the reporters per seed and share.
 pub const DRAWS: u64 = 20;
 /// Shares of the reporters that say a wrong class (0 = every report is true).
-pub const WRONG_SHARES: [f64; 3] = [0.0, 0.1, 0.25];
+pub const WRONG_SHARES: [f64; 4] = [0.0, 0.1, 0.25, 0.4];
 
 /// The labels Mission 1 propagates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

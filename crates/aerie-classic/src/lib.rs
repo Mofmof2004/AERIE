@@ -4,9 +4,11 @@
 //! - `rwr`: random walk with restart (Mission 1).
 //! - `baselines`: majority class and nearest reporter (km or hops), what the methods must beat.
 //! - `eval`: Mission 1 evaluation: reporter draws, methods, scoring.
+//! - `embed`: node embeddings from the traffic graph (Mission 2).
 //! - `m1`: the Mission 1 experiment (labels, graphs, the sweep, CSV and tables).
 
 pub mod baselines;
+pub mod embed;
 pub mod eval;
 pub mod lp;
 pub mod m1;

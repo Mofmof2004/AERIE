@@ -119,6 +119,24 @@ impl Default for SimConfig {
     }
 }
 
+impl SimConfig {
+    /// The default swarm grown (or shrunk) to `n_squads` squads at the same density: the
+    /// arena's area grows with the number of squads, its sides rounded to whole 5 km
+    /// cells. Everything else (ranges, spread, jamming) is unchanged.
+    /// Mission 2 uses 30 squads: 300 drones on 70 × 35 km.
+    pub fn with_squads(n_squads: usize) -> Self {
+        let base = Self::default();
+        let k = (n_squads as f64 / base.n_squads as f64).sqrt();
+        let side = |v: f64, cell: f64| (v * k / cell).round().max(1.0) * cell;
+        SimConfig {
+            n_squads,
+            arena_w: side(base.arena_w, base.cell_width),
+            arena_h: side(base.arena_h, base.cell_height),
+            ..base
+        }
+    }
+}
+
 // Unit tests: compiled only by `cargo test`.
 #[cfg(test)]
 mod tests {

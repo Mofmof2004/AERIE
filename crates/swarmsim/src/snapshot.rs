@@ -16,11 +16,16 @@ use crate::jamming::{Jammer, Ridge, jammed_labels, place_jamming, readings, true
 use crate::links::{LiveGraph, live_graph};
 use crate::spawn::spawn_swarm;
 use crate::tasks::{Task, spawn_tasks};
+use crate::traffic::{TrafficConfig, TrafficLog, traffic_log};
 
 /// The seed split (plan, "split by scenario, never by node").
 pub const TRAIN_SEEDS: Range<u64> = 0..80;
 pub const VAL_SEEDS: Range<u64> = 80..90;
 pub const TEST_SEEDS: Range<u64> = 90..100;
+
+/// The RNG stream of the traffic log, apart from the snapshot's (stream 0) and the
+/// evaluation draws (`aerie_classic::eval`).
+const TRAFFIC_STREAM: u64 = 1 << 48;
 
 /// Everything generated for one seed. Drone `i` is index `i` in every field.
 #[derive(Debug, Clone)]
@@ -79,6 +84,14 @@ impl Snapshot {
     pub fn n(&self) -> usize {
         self.swarm.len()
     }
+
+    /// One flight's traffic over the live graph (Mission 2). Fixed by the seed: its RNG is
+    /// the seed's ChaCha8 on its own stream, so it does not change the snapshot.
+    pub fn traffic(&self, config: &TrafficConfig) -> TrafficLog {
+        let mut rng = ChaCha8Rng::seed_from_u64(self.seed);
+        rng.set_stream(TRAFFIC_STREAM);
+        traffic_log(&self.swarm, &self.live.graph, config, &mut rng)
+    }
 }
 
 #[cfg(test)]
@@ -112,6 +125,23 @@ mod tests {
         assert_eq!(a.readings, b.readings);
         assert_eq!(a.live, b.live);
         assert_ne!(a.readings, Snapshot::build(8, &config).readings);
+    }
+
+    #[test]
+    fn traffic_is_fixed_by_the_seed() {
+        let config = SimConfig::default();
+        let s = Snapshot::build(5, &config);
+        let t = TrafficConfig::default();
+        assert_eq!(s.traffic(&t), s.traffic(&t));
+        assert!(s.traffic(&t).total() > 0);
+    }
+
+    #[test]
+    fn the_300_drone_swarm_builds() {
+        let config = SimConfig::with_squads(30);
+        assert_eq!((config.arena_w, config.arena_h), (70.0, 35.0));
+        let s = Snapshot::build(0, &config);
+        assert_eq!(s.n(), 300);
     }
 
     #[test]
