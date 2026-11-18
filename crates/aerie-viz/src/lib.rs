@@ -5,6 +5,8 @@
 
 pub mod grid;
 pub mod launch;
+pub mod m1_plot;
+pub mod m1_view;
 pub mod map;
 pub mod mission;
 pub mod squads;

@@ -11,6 +11,8 @@ Design decisions and the evidence behind them are in [DECISIONS.md](DECISIONS.md
 AERIE/
 ├── Cargo.toml              workspace: members, shared dependency versions
 ├── DECISIONS.md            decision log: D00 ground rules, D01 epsilon-graph tuning, D02 jamming, ...
+├── RUST_NOTES.md           Rust questions and compiler mistakes, raw material for a cheat sheet
+├── results/                experiment output, one folder per mission (runs.csv not committed)
 ├── crates/
 │   ├── aerie-graph/        graph storage: Edge, EdgeList, degrees, neighbours, components
 │   ├── swarmsim/           the simulator (Mission 0)
@@ -21,14 +23,23 @@ AERIE/
 │   │       ├── spawn.rs    spawn_swarm: places the squads and drones
 │   │       ├── jamming.rs  Jammer, Ridge, jam_power (falloff, ridge shadow), place_jamming (D02), true_power, readings, jammed_labels, fail_links
 │   │       ├── links.rs    the link model (D03): margin, LiveGraph, live_graph
+│   │       ├── snapshot.rs Snapshot::build(seed): everything for one seed in the dataset order; TRAIN/VAL/TEST_SEEDS
 │   │       ├── tasks.rs    TaskId, TaskKind (can_do, needs_relay, able), Task, spawn_tasks, relay_within_two_hops, CostMatrix, cost_matrix, single_winners, joint_winners, assignment_cost
 │   │       ├── graphs.rs   declares the graph modules below
 │   │       └── graphs/
 │   │           ├── epsilon/   epsilon_graph (D00 rule), textbook_epsilon_graph, tests
 │   │           ├── knn/       knn_graph (union rule), tests
 │   │           └── stats.rs   stats(): mean degree, components, cross-squad share
-│   └── aerie-viz/          GUIs (egui): one binary per GUI in src/bin/
-│       └── src/bin/        swarm_viewer.rs, graph_playground.rs, jamming_playground.rs, matrix_playground.rs, lp_playground.rs
+│   ├── aerie-classic/      classical methods, no training (Mission 1)
+│   │   ├── examples/m1.rs  the Mission 1 runner: every method × graph × label × share, test seeds × 20 draws
+│   │   └── src/
+│   │       ├── lp.rs       label_propagation (iterated) and label_propagation_closed_form
+│   │       ├── rwr.rs      random_walk_with_restart (iterated) and its closed form
+│   │       ├── baselines.rs majority_class, nearest_reporter (hops), nearest_reporter_by_distance (km)
+│   │       ├── eval.rs     Method, Problem, draw_reporters, hide, guesses, Score, score
+│   │       └── m1.rs       the Mission 1 experiment: LabelKind, GraphKind, sweep (seeds in parallel), CSV, tables
+│   └── aerie-viz/          GUIs (egui): one binary per GUI in src/bin/; shared map.rs, m1_view.rs (Mission 1 view), m1_plot.rs (results plot)
+│       └── src/bin/        swarm_viewer.rs, graph_playground.rs, jamming_playground.rs, matrix_playground.rs, lp_playground.rs, m1_results.rs
 └── target/                 build output (not committed)
 ```
 
@@ -52,7 +63,7 @@ Run them from the repo root.
 
 Before committing: `cargo fmt`, then `cargo clippy --all-targets`, then `cargo test`.
 
-Crate names: `aerie-graph`, `swarmsim`, `aerie-viz`.
+Crate names: `aerie-graph`, `swarmsim`, `aerie-classic`, `aerie-viz`.
 
 ## Examples
 
@@ -63,6 +74,7 @@ Small programs in `crates/swarmsim/examples/`. Run with `--release`.
 | ε-graph stats | `cargo run --release -p swarmsim --example epsilon_stats` | one row per seed: links, mean degree, components, largest, isolated, share between squads; then the mean and the targets (D01) |
 | Link stats | `cargo run --release -p swarmsim --example link_stats` | link-model calibration (D03): for several N0 and scale settings, links lost, live degree, far links kept, zone links kept, splits, stranded drones, one-way counts |
 | Jamming stats | `cargo run --release -p swarmsim --example jamming_stats` | step 2 end to end, one row per seed: jammed share, relays jammed, links lost, pieces, stranded drones, readings on the wrong side; then the summary (D02) |
+| Mission 1 runner | `cargo run --release -p aerie-classic --example m1` | about 45 s (seeds in parallel). The swarm viewer's Mission 1 view runs the same sweep with a button. Every method (majority, nearest km, nearest hops, LP, RWR α 0.85) on every graph (live, ε, kNN), for every label (zone, squad, role), report share (1 % to 50 %) and share of wrong reports (0, 10, 25 % of the reporters say a wrong class), test seeds 90–99 × 20 draws. Prints the main table (live graph, 10 %), experiment 1 and the wrong-reports tables (accuracy, and the share of lies each method overruled); writes `results/m1/runs.csv` and `results/m1/summary.csv`. No guess counts as wrong. |
 
 ## GUIs
 
@@ -76,6 +88,7 @@ Always use `--release` for the GUIs: they are much smoother.
 | Jamming playground | `cargo run --release -p aerie-viz --bin jamming_playground` |
 | Matrix playground | `cargo run --release -p aerie-viz --bin matrix_playground` |
 | Label propagation playground | `cargo run --release -p aerie-viz --bin lp_playground` |
+| Mission 1 results | `cargo run --release -p aerie-viz --bin m1_results` |
 
 ### Swarm viewer
 
@@ -218,6 +231,49 @@ Mission 1: choose which drones report their class and watch label propagation
   overrules it; with only one honest reporter nearby the lie wins under RWR too), **the silent squad** (experiment 4:
   a squad with no reporter takes its neighbour's class), random drones split west/east with a
   chosen share reporting.
+
+### Swarm viewer, Mission 1 view
+
+Pick **M1 First Contact** in the mission menu of the swarm viewer.
+
+- **Left:** the label to propagate (zone, squad, role), the graph (live, ε, kNN), the method
+  shown on the map, RWR α, the share of drones that report, and the draw (which drones
+  report; fixed by seed and draw, the experiment uses draws 0–19). A button jumps to the first
+  test seed (90).
+- **Who reports:** *Random draw* (as in the experiment: the report share, the share of them
+  that report a wrong class, and the draw number) or *Pick by hand*: click a drone on the map
+  to cycle it silent → reports → **wrong report** (says the next class after its true one) →
+  silent; every method reruns at once. Wrong reporters get a red ring and R instead of gold,
+  and the right panel shows how many lies each method overruled. *Clear all* and *Copy the random draw* to start from.
+  The experiment (Run) still uses random draws.
+- **Show:** *Reports only* (who got a report through, in the class they reported; silent
+  drones dark) or *Propagated labels*. The count of reporting drones is shown below.
+- **Map:** each drone filled with its propagated label (class colours mixed by its row of Y;
+  grey with **?** = no guess), reporters with a gold double ring and a bold **R**, wrong
+  guesses crossed in red,
+  optionally a ring in the true class colour. The links are the graph the method ran on.
+  Hover a drone for its row of Y.
+- **Right:** the list of reporting drones with what each one said (click one to select it on
+  the map), the classes nobody reported, every method's accuracy on this seed and draw, and the
+  selected drone's guess under each method.
+- **Bottom:** *Run the experiment*: the full sweep (test seeds 90–99 × 20 draws, every
+  method × graph × label × share, with the current settings and α) on a background thread
+  with a progress bar, about 45 s. The plot and table have a *Wrong reports* selector (0, 10,
+  25 %); with wrong reports the table also shows the share of lies each method overruled. It writes `results/m1/` and shows the plot and the table
+  below. A test checks that the map's scores are the experiment's scores for the same run.
+
+### Mission 1 results
+
+The same plot and table as the swarm viewer's Mission 1 view, on their own, from
+`results/m1/summary.csv`. *Run the experiment* runs the sweep (about 45 s, default settings).
+
+- **Plot:** accuracy on the silent drones against the share of drones that report (log scale).
+  Colour = method, line style = graph (live solid, ε dashed, kNN dotted), with an optional
+  ±1 sd band over the 200 runs. Hover a point for accuracy, sd, the share with no guess and the
+  number of runs.
+- **Left:** the label (zone, squad, role), the graphs and the methods to show.
+- **Table:** every method on every graph at one share: accuracy ± sd (no-guess share); the best
+  graph per method in bold.
 
 ### Jamming playground
 

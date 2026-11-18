@@ -24,6 +24,7 @@ use swarmsim::tasks::{
 };
 
 use aerie_viz::launch::{GUIS, launch};
+use aerie_viz::m1_view::M1View;
 use aerie_viz::map::{
     self, ColorBy, JAMMED_DRONE_COLOR, JOINT_COLOR, Layers, LinkColor, LinkSource, MapView,
     RELAY_FAIL_COLOR, RangeCircles, Snapshot, WINNER_COLOR, jam_field, n_near_tasks, task_color,
@@ -70,6 +71,8 @@ struct Viewer {
     show_settings: bool,
     /// Last message from the Playgrounds menu (which GUI was started).
     launch_msg: Option<String>,
+    /// The Mission 1 view: propagated labels on the map, and the experiment.
+    m1: M1View,
 }
 
 impl Default for Viewer {
@@ -92,6 +95,7 @@ impl Default for Viewer {
             selected_task: None,
             show_settings: false,
             launch_msg: None,
+            m1: M1View::default(),
         };
         viewer.regenerate();
         viewer
@@ -111,6 +115,19 @@ impl eframe::App for Viewer {
 
         self.settings_window(ui.ctx());
         self.regenerate();
+        if self.mission == Mission::M1 {
+            self.m1.update(
+                self.seed,
+                &self.config,
+                &self.swarm,
+                &self.graph,
+                self.snapshot.as_ref(),
+            );
+            egui::Panel::bottom("m1_experiment")
+                .resizable(true)
+                .default_size(330.0)
+                .show(ui, |ui| self.m1.bottom(ui, &self.config));
+        }
 
         egui::Panel::right("details")
             .resizable(true)
@@ -204,6 +221,10 @@ impl Viewer {
             });
         ui.weak(self.mission.description());
         ui.separator();
+        if self.mission == Mission::M1 {
+            self.m1.controls(ui, &mut self.seed);
+            ui.separator();
+        }
 
         // Scenario: seed and config.
         ui.label(RichText::new("Scenario").strong());
@@ -412,7 +433,7 @@ impl Viewer {
                 ));
             });
         }
-        map::draw(
+        let clicked = map::draw(
             ui,
             &mut self.view,
             &self.layers,
@@ -423,7 +444,18 @@ impl Viewer {
             self.snapshot.as_ref(),
             &mut self.selected,
             &mut self.selected_task,
+            if self.mission == Mission::M1 {
+                self.m1.overlay()
+            } else {
+                None
+            }
+            .as_ref(),
         );
+        if self.mission == Mission::M1
+            && let Some(i) = clicked
+        {
+            self.m1.clicked(i);
+        }
     }
 
     /// Top bar: a Playgrounds menu that opens each GUI in its own window, and the settings.
@@ -722,6 +754,9 @@ impl Viewer {
 
     /// Right panel: swarm summary, selected drone, squads table.
     fn details(&mut self, ui: &mut egui::Ui) {
+        if self.mission == Mission::M1 {
+            self.m1.details(ui, &mut self.selected);
+        }
         let cfg = &self.config;
 
         ui.label(RichText::new("Swarm").strong());
@@ -1246,5 +1281,94 @@ mod tests {
         assert!(
             v.config.n_squads <= cell_count(&v.config, v.config.cell_width, v.config.cell_height)
         );
+    }
+
+    #[test]
+    fn mission_1_hand_picked_reporters() {
+        // Pick by hand: clicking switches a drone; clearing leaves nobody reporting, so
+        // every silent drone has no guess under label propagation.
+        use aerie_viz::m1_view::{HandReport, ReportSource};
+        let mut v = Viewer {
+            mission: Mission::M1,
+            seed: 90,
+            ..Viewer::default()
+        };
+        v.regenerate();
+        v.m1.source = ReportSource::Hand;
+        v.m1.update(v.seed, &v.config, &v.swarm, &v.graph, v.snapshot.as_ref());
+        v.m1.hand.fill(HandReport::Silent);
+        v.m1.update(v.seed, &v.config, &v.swarm, &v.graph, v.snapshot.as_ref());
+        let lp = v.m1.scores().unwrap()[3];
+        assert_eq!((lp.scored, lp.no_guess, lp.right), (100, 100, 0));
+
+        v.m1.clicked(7);
+        assert_eq!(v.m1.hand[7], HandReport::Honest);
+        v.m1.update(v.seed, &v.config, &v.swarm, &v.graph, v.snapshot.as_ref());
+        let lp = v.m1.scores().unwrap()[3];
+        assert_eq!((lp.scored, lp.liars), (99, 0), "drone 7 now reports");
+        v.m1.clicked(7);
+        assert_eq!(
+            v.m1.hand[7],
+            HandReport::Wrong,
+            "a second click makes it lie"
+        );
+        v.m1.update(v.seed, &v.config, &v.swarm, &v.graph, v.snapshot.as_ref());
+        let lp = v.m1.scores().unwrap()[3];
+        assert_eq!(
+            (lp.liars, lp.overruled),
+            (1, 0),
+            "label propagation keeps the lie"
+        );
+        v.m1.clicked(7);
+        assert_eq!(
+            v.m1.hand[7],
+            HandReport::Silent,
+            "a third click silences it"
+        );
+    }
+
+    #[test]
+    fn mission_1_view_shows_the_experiments_runs() {
+        // Seed 90, draw 3, 10 % report, squad label, live graph: the map's scores are the
+        // ones the experiment records for that run (same snapshot, same draw).
+        use aerie_classic::eval::{Problem, corrupt, draw_reporters, hide, score};
+        use aerie_classic::m1::{GraphKind, LabelKind, methods, positions};
+        use swarmsim::snapshot::Snapshot as DataSnapshot;
+
+        let mut v = Viewer {
+            mission: Mission::M1,
+            seed: 90,
+            ..Viewer::default()
+        };
+        v.regenerate();
+        v.m1.draw = 3;
+        v.m1.wrong = 0.1;
+        v.m1.update(v.seed, &v.config, &v.swarm, &v.graph, v.snapshot.as_ref());
+        let shown = v.m1.scores().expect("seed 90 has a snapshot").to_vec();
+        assert!(v.m1.overlay().is_some());
+
+        let snap = DataSnapshot::build(90, &v.config);
+        let truth = LabelKind::Squad.truth(&snap.swarm, &snap.jammed);
+        let reports = draw_reporters(snap.n(), 0.1, 90, 3);
+        // 10 % of the reporters wrong, as the view's slider sets below.
+        let labels = corrupt(&hide(&truth, &reports), 10, 0.1, 90, 3);
+        let graph =
+            GraphKind::Live.build(&snap.swarm, &snap.geometric, &snap.live.graph, &v.config);
+        let p = graph.transition_matrix();
+        let pos = positions(&snap.swarm);
+        let problem = Problem {
+            p: &p,
+            positions: &pos,
+            labels: &labels,
+            n_classes: v.config.n_squads,
+        };
+        for (m, method) in methods(0.85).iter().enumerate() {
+            assert_eq!(
+                shown[m],
+                score(&method.run(&problem), &truth, &labels),
+                "{}",
+                method.name()
+            );
+        }
     }
 }

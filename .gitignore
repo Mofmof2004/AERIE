@@ -1,1 +1,3 @@
 /target
+# Per-run rows are big and reproducible (cargo run --release -p aerie-classic --example m1); the summaries are kept.
+results/*/runs.csv

@@ -209,8 +209,32 @@ pub const WINNER_COLOR: Color32 = Color32::from_rgb(255, 200, 40);
 pub const JOINT_COLOR: Color32 = Color32::from_rgb(70, 220, 255);
 /// Cross on drones whose role fits the selected task but that fail the relay rule.
 pub const RELAY_FAIL_COLOR: Color32 = Color32::from_rgb(255, 70, 70);
+/// Mission 1: the ring and the "R" on drones whose report got through.
+pub const REPORT_COLOR: Color32 = Color32::from_rgb(255, 215, 0);
 /// Drones in the jammed zone: lime, used by no squad, role or task kind.
 pub const JAMMED_DRONE_COLOR: Color32 = Color32::from_rgb(200, 255, 0);
+
+/// Mission 1 on the map: replaces the drone colours with the propagated labels, marks
+/// who reported and who was guessed wrong, and draws the graph the method ran on.
+/// Every slice has one entry per drone.
+pub struct LabelOverlay<'a> {
+    /// Fill of each drone: its class colours mixed by its row of Y (grey: no guess).
+    pub fill: &'a [Color32],
+    /// Drones whose label reached the method (gold ring, "R").
+    pub reports: &'a [bool],
+    /// Reporters that said a wrong class (red ring instead of gold).
+    pub lies: &'a [bool],
+    /// Silent drones guessed wrong (red cross). Empty slice: no marks.
+    pub wrong: &'a [bool],
+    /// Silent drones with no guess ("?").
+    pub no_guess: &'a [bool],
+    /// Outer ring in the drone's true class colour, if given.
+    pub truth: Option<&'a [Color32]>,
+    /// The graph the method ran on (drawn instead of the chosen link source).
+    pub links: &'a EdgeList,
+    /// Extra lines for the drone tooltip.
+    pub hover: &'a [String],
+}
 
 /// Map layers the user can switch on and off.
 pub struct Layers {
@@ -315,6 +339,8 @@ impl Transform {
 }
 
 /// Draws the map and handles zoom, pan, hover and click-to-select (a drone or a task).
+/// With `overlay` (Mission 1), the drones show propagated labels instead, and a click
+/// picks a drone before a task. Returns the drone clicked this frame, if any.
 // Each input is a separate piece of viewer state; bundling them would only move the list.
 #[allow(clippy::too_many_arguments)]
 pub fn draw(
@@ -328,7 +354,9 @@ pub fn draw(
     snap: Option<&Snapshot>,
     selected: &mut Option<usize>,
     selected_task: &mut Option<usize>,
-) {
+    overlay: Option<&LabelOverlay>,
+) -> Option<usize> {
+    let overlay = overlay.filter(|o| o.fill.len() == swarm.len());
     let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
     let rect = response.rect;
 
@@ -465,12 +493,18 @@ pub fn draw(
     // Links of the comm graph. Width = weight. With a drone selected, its links stay
     // bright and the others fade. Skipped if the graph is out of date with the swarm.
     let live_links = layers.link_source == LinkSource::Live && snap.is_some();
-    let link_graph: &EdgeList = match snap {
-        Some(s) if live_links => &s.live.graph,
+    let link_graph: &EdgeList = match (overlay, snap) {
+        (Some(o), _) => o.links,
+        (None, Some(s)) if live_links => &s.live.graph,
         _ => graph,
     };
     // Geometric links that jamming killed (live edges keep the geometric order).
-    if layers.links && layers.dead_links && live_links && graph.n as usize == swarm.len() {
+    if layers.links
+        && layers.dead_links
+        && live_links
+        && overlay.is_none()
+        && graph.n as usize == swarm.len()
+    {
         let mut l = 0;
         for e in &graph.edges {
             let alive = link_graph
@@ -534,9 +568,17 @@ pub fn draw(
         {
             fill = fill.gamma_multiply(0.25);
         }
-        let jammed = layers.jamming && snap.is_some_and(|s| s.labels.get(i) == Some(&true));
+        let jammed = overlay.is_none()
+            && layers.jamming
+            && snap.is_some_and(|s| s.labels.get(i) == Some(&true));
         if jammed {
             fill = JAMMED_DRONE_COLOR;
+        }
+        if let Some(o) = overlay {
+            fill = o.fill[i];
+            if let Some(truth) = o.truth {
+                painter.circle_stroke(c, radius + 3.5, Stroke::new(2.5, truth[i]));
+            }
         }
         // Role fits, but the task needs a relay within 2 hops and this drone has none.
         let cut_off = task_kind.is_some_and(|k| {
@@ -568,6 +610,46 @@ pub fn draw(
         }
         if jammed {
             painter.circle_stroke(c, radius + 2.5, Stroke::new(1.5, JAMMED_DRONE_COLOR));
+        }
+        if let Some(o) = overlay {
+            if o.reports[i] {
+                // Reporting drone: a double ring (dark edge so it shows on any fill) and a
+                // bold "R" above the drone; gold for a true report, red for a wrong one.
+                let mark = if o.lies.get(i) == Some(&true) {
+                    RELAY_FAIL_COLOR
+                } else {
+                    REPORT_COLOR
+                };
+                painter.circle_stroke(
+                    c,
+                    radius + 3.0,
+                    Stroke::new(5.0, Color32::from_black_alpha(200)),
+                );
+                painter.circle_stroke(c, radius + 3.0, Stroke::new(3.0, mark));
+                let at = c + vec2(radius + 3.0, -radius - 3.0);
+                painter.circle_filled(at, 6.5, Color32::from_black_alpha(200));
+                painter.text(
+                    at,
+                    Align2::CENTER_CENTER,
+                    "R",
+                    FontId::proportional(10.0),
+                    mark,
+                );
+            } else if o.no_guess.get(i) == Some(&true) {
+                painter.text(
+                    c,
+                    Align2::CENTER_CENTER,
+                    "?",
+                    FontId::proportional(radius * 1.6),
+                    Color32::WHITE,
+                );
+            }
+            if o.wrong.get(i) == Some(&true) {
+                let k = radius * 0.8;
+                let cross = Stroke::new(2.5, RELAY_FAIL_COLOR);
+                painter.line_segment([c - vec2(k, k), c + vec2(k, k)], cross);
+                painter.line_segment([c + vec2(-k, k), c + vec2(k, -k)], cross);
+            }
         }
         if layers.ids {
             painter.text(
@@ -683,14 +765,21 @@ pub fn draw(
         snap.filter(|_| layers.tasks)
             .and_then(|s| nearest_task(&t, &s.tasks, p, 9.0))
     };
+    let mut clicked = None;
     if response.clicked() {
         let p = response.interact_pointer_pos();
-        if let Some(k) = p.and_then(near_task) {
-            *selected_task = Some(k);
-            *selected = None;
-        } else {
-            *selected = p.and_then(near);
-            *selected_task = None;
+        let drone = p.and_then(near);
+        let task = p.and_then(near_task);
+        match (task, drone) {
+            (Some(k), d) if overlay.is_none() || d.is_none() => {
+                *selected_task = Some(k);
+                *selected = None;
+            }
+            (_, d) => {
+                *selected = d;
+                *selected_task = None;
+                clicked = d;
+            }
         }
     }
     if let (Some(k), Some(s)) = (response.hover_pos().and_then(near_task), snap) {
@@ -776,6 +865,14 @@ pub fn draw(
                     .count();
                 ui.label(format!("Live links: {live} of {n_links}"));
             }
+            if let Some(o) = overlay
+                && let Some(line) = o.hover.get(i)
+            {
+                ui.separator();
+                for l in line.lines() {
+                    ui.label(l);
+                }
+            }
             ui.weak("Click to select");
         });
     } else if let Some(p) = response.hover_pos() {
@@ -789,6 +886,7 @@ pub fn draw(
             text.gamma_multiply(0.7),
         );
     }
+    clicked
 }
 
 /// Fill colour of a drone for the chosen encoding.

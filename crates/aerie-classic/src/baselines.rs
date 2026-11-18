@@ -47,6 +47,37 @@ pub fn nearest_reporter(p: &Mat<f64>, labels: &[Option<usize>], n_classes: usize
     one_hot_rows(&class, n_classes)
 }
 
+/// Every silent drone takes the class of the closest reporter in km, ignoring the graph
+/// (the plan's nearest-neighbour baseline). `positions[i]` is drone i's (x, y). Ties go
+/// to the reporter with the smallest index. With no reporters, every silent row is zero.
+pub fn nearest_reporter_by_distance(
+    positions: &[[f64; 2]],
+    labels: &[Option<usize>],
+    n_classes: usize,
+) -> Mat<f64> {
+    assert_eq!(labels.len(), positions.len(), "one label slot per drone");
+    let reporters: Vec<(usize, usize)> = labels
+        .iter()
+        .enumerate()
+        .filter_map(|(j, l)| l.map(|c| (j, c)))
+        .collect();
+    let dist2 = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2);
+
+    let guesses: Vec<Option<usize>> = labels
+        .iter()
+        .zip(positions)
+        .map(|(&own, &at)| {
+            own.or_else(|| {
+                reporters
+                    .iter()
+                    .min_by(|a, b| dist2(at, positions[a.0]).total_cmp(&dist2(at, positions[b.0])))
+                    .map(|&(_, c)| c)
+            })
+        })
+        .collect();
+    one_hot_rows(&guesses, n_classes)
+}
+
 /// Row i is the one-hot of `guesses[i]`, or all zeros for `None`.
 fn one_hot_rows(guesses: &[Option<usize>], n_classes: usize) -> Mat<f64> {
     Mat::from_fn(guesses.len(), n_classes, |i, c| {
@@ -117,6 +148,26 @@ mod tests {
         assert_eq!(row(&y, 1), [0.0, 1.0]);
         assert_eq!(row(&y, 2), [0.0, 0.0]);
         assert_eq!(row(&y, 3), [0.0, 0.0]);
+    }
+
+    #[test]
+    fn nearest_by_distance_ignores_the_graph() {
+        // Drone 1 is 1 km from reporter 0 and 3 km from reporter 2; drone 3 is 0.5 km
+        // from reporter 2. No graph needed, even a cut-off drone gets a guess.
+        let positions = [[0.0, 0.0], [1.0, 0.0], [4.0, 0.0], [4.0, 0.5]];
+        let y = nearest_reporter_by_distance(&positions, &[Some(0), None, Some(1), None], 2);
+        assert_eq!(row(&y, 1), [1.0, 0.0]);
+        assert_eq!(row(&y, 3), [0.0, 1.0]);
+        assert_eq!(row(&y, 2), [0.0, 1.0], "a reporter keeps its own class");
+    }
+
+    #[test]
+    fn nearest_by_distance_tie_and_no_reports() {
+        let positions = [[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]];
+        let y = nearest_reporter_by_distance(&positions, &[Some(1), None, Some(0)], 2);
+        assert_eq!(row(&y, 1), [0.0, 1.0], "tie: the smaller index wins");
+        let y = nearest_reporter_by_distance(&positions, &[None, None, None], 2);
+        assert_eq!(row(&y, 1), [0.0, 0.0]);
     }
 
     #[test]

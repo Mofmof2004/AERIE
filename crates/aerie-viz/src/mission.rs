@@ -80,6 +80,6 @@ impl Mission {
 
     /// Whether this mission has a view yet.
     pub fn available(self) -> bool {
-        matches!(self, Mission::M0)
+        matches!(self, Mission::M0 | Mission::M1)
     }
 }

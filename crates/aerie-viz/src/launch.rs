@@ -13,7 +13,7 @@ pub struct Gui {
 }
 
 /// Every GUI, in menu order.
-pub const GUIS: [Gui; 5] = [
+pub const GUIS: [Gui; 6] = [
     Gui {
         bin: "swarm_viewer",
         title: "Swarm viewer",
@@ -38,6 +38,11 @@ pub const GUIS: [Gui; 5] = [
         bin: "lp_playground",
         title: "Label propagation playground",
         about: "Choose who reports, watch the labels spread round by round (Mission 1).",
+    },
+    Gui {
+        bin: "m1_results",
+        title: "Mission 1 results",
+        about: "Accuracy against report share for every method and graph; runs the m1 runner.",
     },
 ];
 

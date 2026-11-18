@@ -7,3 +7,6 @@ description = "Classical graph methods with no trained network: label propagatio
 [dependencies]
 aerie-graph = { path = "../aerie-graph" }
 faer = { workspace = true }
+rand = { workspace = true }
+rand_chacha = { workspace = true }
+swarmsim = { path = "../swarmsim" }   # the Mission 1 experiment (m1.rs) reads snapshots
