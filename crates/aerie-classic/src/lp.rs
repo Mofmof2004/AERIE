@@ -3,6 +3,7 @@
 
 use faer::Mat;
 use faer::linalg::solvers::Solve;
+use std::collections::VecDeque;
 
 /// Label propagation: spreads the known labels over the graph until nothing moves.
 ///
@@ -89,9 +90,10 @@ pub fn label_propagation(
 ///
 /// Solved with an LU factorization (`partial_piv_lu().solve`), never forming an inverse.
 ///
-/// Not handled yet: a silent drone with no path to any labelled drone (isolated, or a
-/// silent squad cut off from every report) makes M singular, and its row comes out as
-/// inf or NaN. The iterative version gives it zeros.
+/// A silent drone with no path to any labelled drone (isolated, or a silent squad cut off
+/// from every report) would make M singular. A BFS from all labelled drones finds them
+/// first; they keep an identity row in M and a zero row in B, so they get a row of zeros,
+/// like the iteration.
 pub fn label_propagation_closed_form(
     p: &Mat<f64>,
     labels: &[Option<usize>],
@@ -111,9 +113,30 @@ pub fn label_propagation_closed_form(
         }
     }
 
+    // Which drones can reach a label: a BFS started from every labelled drone at once.
+    let mut reached = vec![false; n];
+    let mut queue: VecDeque<usize> = VecDeque::new();
+
+    for i in 0..n {
+        if labels[i].is_some() {
+            reached[i] = true;
+            queue.push_back(i);
+        }
+    }
+
+    while let Some(i) = queue.pop_front() {
+        for j in 0..n {
+            if p[(i, j)] != 0.0 && !reached[j] {
+                reached[j] = true;
+                queue.push_back(j);
+            }
+        }
+    }
+
     let mut new_y: Mat<f64> = y.clone();
     for i in 0..n {
-        if labels[i].is_none() {
+        // Unreachable silent drones skip this: identity row in M, zero row in B, so Y_i = 0.
+        if labels[i].is_none() && reached[i] {
             for j in 0..n {
                 if labels[j].is_none() {
                     index_matrix[(i, j)] -= p[(i, j)];
@@ -301,7 +324,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "next step: silent drones with no path to a label make M singular"]
     fn closed_form_gives_zeros_where_no_label_can_reach() {
         // Same answer as the iteration: drone 2 is isolated and silent, so its row is
         // zero. Today the solve returns inf or NaN there.
