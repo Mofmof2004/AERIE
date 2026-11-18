@@ -1,0 +1,9 @@
+[package]
+name = "aerie-classic"
+version = "0.1.0"
+edition.workspace = true
+description = "Classical graph methods with no trained network: label propagation, and later embeddings, regularization, spectral analysis."
+
+[dependencies]
+aerie-graph = { path = "../aerie-graph" }
+faer = { workspace = true }
