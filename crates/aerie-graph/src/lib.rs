@@ -3,6 +3,7 @@
 //! Graphs are stored as weighted edge lists, the format every mission reads.
 //! This crate knows nothing about drones: nodes are plain indices.
 
+use faer::Mat;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
@@ -48,6 +49,43 @@ impl EdgeList {
         degrees
     }
 
+    /// Adjacency matrix A (Mission 1): `A[i][j]` is the weight of the link i-j, 0 when
+    /// there is none. n x n and dense (a faer `Mat`).
+    ///
+    /// Symmetric, because each undirected link is written at both (i, j) and (j, i).
+    /// Zero diagonal, because there are no self-loops. Row i sums to `degrees()[i]`.
+    ///
+    /// Dense costs n² memory: fine at 100 drones, too much at 100k (Mission 9 needs CSR).
+    pub fn adjacency_matrix(&self) -> Mat<f64> {
+        let n = self.n as usize;
+        let mut a: Mat<f64> = Mat::zeros(n, n);
+
+        for edge in &self.edges {
+            a[(edge.src as usize, edge.dst as usize)] = edge.weight;
+            a[(edge.dst as usize, edge.src as usize)] = edge.weight;
+        }
+
+        a
+    }
+
+    /// Degree matrix D (Mission 1): diagonal, `D[i][i]` = weighted degree of node i (the
+    /// sum of row i of A), zeros everywhere else. A degree belongs to one node, so there
+    /// is nothing off the diagonal.
+    ///
+    /// Built from A with a double loop (n² steps); `degrees()` gives the same diagonal
+    /// from the edges alone, and the tests check that they agree.
+    pub fn degree_matrix(&self) -> Mat<f64> {
+        let n = self.n as usize;
+        let mut d: Mat<f64> = Mat::zeros(n, n);
+        let a: Mat<f64> = self.adjacency_matrix();
+        for i in 0..n {
+            for j in 0..n {
+                d[(i, i)] += a[(i, j)];
+            }
+        }
+
+        d
+    }
     /// Adjacency list: entry `i` holds the indices of the nodes linked to node `i`.
     ///
     /// Returns a vector of length `n`. Isolated nodes get an empty list.
@@ -185,5 +223,114 @@ mod tests {
             ],
         };
         assert_eq!(g.components(), vec![0, 1, 1, 0]);
+    }
+
+    /// Checks that `m` equals the grid `expected`, cell by cell, within 1e-12.
+    fn assert_mat(m: &Mat<f64>, expected: &[&[f64]]) {
+        assert_eq!(m.nrows(), expected.len(), "rows");
+        for (i, row) in expected.iter().enumerate() {
+            assert_eq!(m.ncols(), row.len(), "columns");
+            for (j, &want) in row.iter().enumerate() {
+                let got = m[(i, j)];
+                assert!(
+                    (got - want).abs() < 1e-12,
+                    "({i}, {j}): got {got}, want {want}"
+                );
+            }
+        }
+    }
+
+    /// Path 0 - 1 - 2 with two different weights, so a mix-up of rows shows.
+    fn weighted_path() -> EdgeList {
+        EdgeList {
+            n: 3,
+            edges: vec![
+                Edge {
+                    src: 0,
+                    dst: 1,
+                    weight: 0.5,
+                },
+                Edge {
+                    src: 1,
+                    dst: 2,
+                    weight: 2.0,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn adjacency_triangle_plus_isolated() {
+        // Each triangle node links to the other two with weight 1; node 3 has no links,
+        // so its row and column are zero. Nothing on the diagonal.
+        let a = triangle_plus_isolated().adjacency_matrix();
+        assert_mat(
+            &a,
+            &[
+                &[0.0, 1.0, 1.0, 0.0],
+                &[1.0, 0.0, 1.0, 0.0],
+                &[1.0, 1.0, 0.0, 0.0],
+                &[0.0, 0.0, 0.0, 0.0],
+            ],
+        );
+    }
+
+    #[test]
+    fn adjacency_keeps_the_weights_and_is_symmetric() {
+        let a = weighted_path().adjacency_matrix();
+        assert_mat(&a, &[&[0.0, 0.5, 0.0], &[0.5, 0.0, 2.0], &[0.0, 2.0, 0.0]]);
+        for i in 0..3 {
+            for j in 0..3 {
+                assert_eq!(a[(i, j)], a[(j, i)]);
+            }
+        }
+    }
+
+    #[test]
+    fn degree_triangle_plus_isolated() {
+        // Diagonal = degrees [2, 2, 2, 0], zeros elsewhere.
+        let d = triangle_plus_isolated().degree_matrix();
+        assert_mat(
+            &d,
+            &[
+                &[2.0, 0.0, 0.0, 0.0],
+                &[0.0, 2.0, 0.0, 0.0],
+                &[0.0, 0.0, 2.0, 0.0],
+                &[0.0, 0.0, 0.0, 0.0],
+            ],
+        );
+    }
+
+    #[test]
+    fn degree_matrix_agrees_with_degrees_and_row_sums_of_a() {
+        // Two separate pieces of code must agree: D from A (double loop) and
+        // degrees() from the edge list. Weighted path: [0.5, 2.5, 2.0].
+        for g in [weighted_path(), triangle_plus_isolated()] {
+            let d = g.degree_matrix();
+            let a = g.adjacency_matrix();
+            let deg = g.degrees();
+            let n = g.n as usize;
+            for i in 0..n {
+                assert!((d[(i, i)] - deg[i]).abs() < 1e-12);
+                let row_sum: f64 = (0..n).map(|j| a[(i, j)]).sum();
+                assert!((d[(i, i)] - row_sum).abs() < 1e-12);
+                for j in 0..n {
+                    if i != j {
+                        assert_eq!(d[(i, j)], 0.0, "off-diagonal ({i}, {j})");
+                    }
+                }
+            }
+        }
+        assert_eq!(weighted_path().degrees(), vec![0.5, 2.5, 2.0]);
+    }
+
+    #[test]
+    fn empty_graph_gives_empty_matrices() {
+        let g = EdgeList {
+            n: 0,
+            edges: vec![],
+        };
+        assert_eq!(g.adjacency_matrix().nrows(), 0);
+        assert_eq!(g.degree_matrix().ncols(), 0);
     }
 }

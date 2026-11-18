@@ -11,6 +11,7 @@ rand_chacha = "0.10.0"
 rand_distr = "0.6.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+faer = "0.24.4"            # dense linear algebra: matrices, solves, eigenvalues (Mission 1 on)
 pathfinding = "4.16.0"     # Hungarian algorithm (kuhn_munkres) for the joint oracle labels
 eframe = "0.37.0"          # native GUI window + egui, used only by aerie-viz
 
