@@ -95,6 +95,97 @@ for &c in labels.iter().flatten() {
 
 `&c` in the pattern takes the value out of the reference, so `c` is a plain `usize`.
 
+### What does `max_by_key(...)` with `Reverse` and `.filter` do?
+
+```rust
+let winner = (0..n_classes)
+    .max_by_key(|&c| (counts[c], Reverse(c)))
+    .filter(|&c| counts[c] > 0);
+```
+
+- `(0..n_classes)`: an iterator over the class numbers.
+- `max_by_key(|&c| key)`: returns the item whose key is largest, as an `Option` (`None` if
+  there are no items). On a tie it returns the **last** maximum.
+- Tuples compare left to right: first the count, then, on a tie, the second element.
+- `Reverse(c)` (from `std::cmp`) flips the comparison: `Reverse(1) > Reverse(2)`. So on a
+  tie the **smallest** class wins.
+- `Option::filter(cond)`: keeps `Some(c)` if `cond` holds, otherwise gives `None`. Here: no
+  winner when nobody reported.
+
+Same thing as a loop:
+
+```rust
+let mut winner = None;
+let mut best = 0;
+for c in 0..n_classes {
+    if counts[c] > best { best = counts[c]; winner = Some(c); } // strict >: ties keep the smaller class
+}
+```
+
+### What does `Reverse` do?
+
+`std::cmp::Reverse` wraps a value and flips how it compares: `Reverse(1) > Reverse(2)`. The
+value itself is unchanged (`Reverse(5).0 == 5`). Used inside a key to flip one direction:
+
+```rust
+v.sort_by_key(|&x| Reverse(x));          // biggest first
+max_by_key(|&c| (counts[c], Reverse(c))) // biggest count, then smallest c on a tie
+```
+
+### What does `iter().map(...).collect()` do? And `Option::or`?
+
+Take a list, transform each item, gather the results into a new list.
+
+```rust
+let guesses: Vec<Option<usize>> = labels.iter().map(|&l| l.or(winner)).collect();
+```
+
+- `.map(|&l| ...)`: a closure (inline function) applied to every item; what it returns is
+  the new item. `&l` takes the value out of the reference.
+- `l.or(winner)`: `l` if it is `Some`, otherwise `winner`.
+- `.collect()`: builds the collection named in the type annotation (`Vec<...>` here); the
+  annotation is required, or `collect` doesn't know what to build.
+
+Same as:
+
+```rust
+let mut guesses = Vec::new();
+for &l in labels.iter() {
+    guesses.push(l.or(winner));
+}
+```
+
+### What does `assert_eq!(a, b, "message")` do?
+
+Checks `a == b`. If equal, nothing happens; if not, the program panics (stops) and prints
+both values and the message. Used at the top of a function to fail early, with a clear
+message, when the inputs don't fit what the function assumes.
+
+```rust
+assert_eq!(labels.len(), n, "one label slot per drone");
+assert!(alpha < 1.0, "alpha must be below 1"); // any condition
+assert_ne!(n, 0);                              // not equal
+debug_assert!(x >= 0.0);                       // checked in debug builds only
+```
+
+Tests use the same macros: a test passes if nothing panics.
+
+### What does `(0..n).filter(...).collect()` do?
+
+Keeps the **indices** that pass a test, and gathers them into a collection.
+
+```rust
+// labels = [Some(0), None, None, Some(1), None]  ->  queue = [0, 3]
+let mut queue: VecDeque<usize> = (0..n).filter(|&i| labels[i].is_some()).collect();
+```
+
+- `(0..n)`: the drone numbers. `.filter(|&i| cond)`: keeps `i` only if `cond` is `true`.
+- It keeps the numbers `i`, not `labels[i]`. For the values themselves:
+  `labels.iter().flatten()`.
+- `map` transforms every item (same count out); `filter` keeps or drops items unchanged
+  (maybe fewer out). `collect` can build a `Vec`, a `VecDeque`, a `HashSet`… whatever the
+  annotation says.
+
 ## Mistakes the compiler caught
 
 | Mistake | Fix | Why |
