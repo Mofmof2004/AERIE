@@ -86,6 +86,38 @@ impl EdgeList {
 
         d
     }
+
+    /// Transition matrix P = D⁻¹A (Mission 1): `P[i][j] = A[i][j] / D[i][i]`, the chance
+    /// that a random walk at node i steps to neighbour j. Every row sums to 1, so
+    /// `(P Y)[i]` is the weighted average of i's neighbours: the step label propagation
+    /// repeats.
+    ///
+    /// Isolated nodes (degree 0) get a self-loop, `P[i][i] = 1`: the row still sums to 1,
+    /// and the node keeps whatever it starts with instead of dividing by zero.
+    ///
+    /// Not symmetric in general: `P[i][j]` divides by i's degree, `P[j][i]` by j's.
+    /// Built as the product D⁻¹ × A (n³ steps; dividing each row of A would be n²).
+    pub fn transition_matrix(&self) -> Mat<f64> {
+        let n = self.n as usize;
+        let a: Mat<f64> = self.adjacency_matrix();
+        let d: Mat<f64> = self.degree_matrix();
+        let mut d_inverse: Mat<f64> = Mat::zeros(n, n);
+
+        for i in 0..n {
+            if d[(i, i)] != 0.0 {
+                d_inverse[(i, i)] = 1.0 / (d[(i, i)]);
+            }
+        }
+
+        let mut p = &d_inverse * &a;
+        for i in 0..n {
+            if d[(i, i)] == 0.0 {
+                p[(i, i)] = 1.0;
+            }
+        }
+
+        p
+    }
     /// Adjacency list: entry `i` holds the indices of the nodes linked to node `i`.
     ///
     /// Returns a vector of length `n`. Isolated nodes get an empty list.
@@ -325,6 +357,52 @@ mod tests {
     }
 
     #[test]
+    fn transition_triangle_plus_isolated() {
+        // Triangle nodes split evenly over their 2 neighbours; node 3 is isolated and
+        // gets the self-loop.
+        let p = triangle_plus_isolated().transition_matrix();
+        assert_mat(
+            &p,
+            &[
+                &[0.0, 0.5, 0.5, 0.0],
+                &[0.5, 0.0, 0.5, 0.0],
+                &[0.5, 0.5, 0.0, 0.0],
+                &[0.0, 0.0, 0.0, 1.0],
+            ],
+        );
+    }
+
+    #[test]
+    fn transition_divides_each_row_by_its_own_degree() {
+        // Degrees [0.5, 2.5, 2.0]. Node 1: 0.5 / 2.5 = 0.2 to node 0, 2.0 / 2.5 = 0.8
+        // to node 2. Ends have one neighbour each, so they step there for sure.
+        let p = weighted_path().transition_matrix();
+        assert_mat(&p, &[&[0.0, 1.0, 0.0], &[0.2, 0.0, 0.8], &[0.0, 1.0, 0.0]]);
+        // Not symmetric: P[1][0] = 0.2 but P[0][1] = 1.
+        assert!((p[(1, 0)] - p[(0, 1)]).abs() > 0.5);
+    }
+
+    #[test]
+    fn transition_rows_sum_to_one_and_d_times_p_is_a() {
+        for g in [weighted_path(), triangle_plus_isolated()] {
+            let p = g.transition_matrix();
+            let a = g.adjacency_matrix();
+            let deg = g.degrees();
+            let n = g.n as usize;
+            for i in 0..n {
+                let row_sum: f64 = (0..n).map(|j| p[(i, j)]).sum();
+                assert!((row_sum - 1.0).abs() < 1e-12, "row {i} sums to {row_sum}");
+                // Undo the division: D[i][i] * P[i][j] = A[i][j] (linked nodes only).
+                if deg[i] > 0.0 {
+                    for j in 0..n {
+                        assert!((deg[i] * p[(i, j)] - a[(i, j)]).abs() < 1e-12);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn empty_graph_gives_empty_matrices() {
         let g = EdgeList {
             n: 0,
@@ -332,5 +410,6 @@ mod tests {
         };
         assert_eq!(g.adjacency_matrix().nrows(), 0);
         assert_eq!(g.degree_matrix().ncols(), 0);
+        assert_eq!(g.transition_matrix().nrows(), 0);
     }
 }

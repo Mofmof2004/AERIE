@@ -28,7 +28,7 @@ AERIE/
 │   │           ├── knn/       knn_graph (union rule), tests
 │   │           └── stats.rs   stats(): mean degree, components, cross-squad share
 │   └── aerie-viz/          GUIs (egui): one binary per GUI in src/bin/
-│       └── src/bin/        swarm_viewer.rs, graph_playground.rs, jamming_playground.rs
+│       └── src/bin/        swarm_viewer.rs, graph_playground.rs, jamming_playground.rs, matrix_playground.rs
 └── target/                 build output (not committed)
 ```
 
@@ -74,6 +74,7 @@ Always use `--release` for the GUIs: they are much smoother.
 | Swarm viewer, by name | `cargo run --release -p aerie-viz --bin swarm_viewer` |
 | Graph playground | `cargo run --release -p aerie-viz --bin graph_playground` |
 | Jamming playground | `cargo run --release -p aerie-viz --bin jamming_playground` |
+| Matrix playground | `cargo run --release -p aerie-viz --bin matrix_playground` |
 
 ### Swarm viewer
 
@@ -166,6 +167,23 @@ Place drones by hand and watch the comm graph form. It calls the real builders
   | Dashed edge (kNN mode) | kNN link longer than the radio range |
   | Dashed ring around the selected drone | σ ring, where the weight is 0.607 |
   | Dashed curve on the kernel plot | weight beyond ε, where no edge exists |
+
+### Matrix playground
+
+Mission 1: place drones by hand and see the matrices of their comm graph next to the map.
+Links follow the swarm rule (`epsilon_graph`, D00) with Gaussian weights; the matrices come
+from the real functions in `aerie-graph`.
+
+- **A** (`adjacency_matrix`), **D** (`degree_matrix`), optional **A² = A × A** (2-hop walks),
+  and **P = D⁻¹A** (`transition_matrix`). Each grid has a Σ column with the row sums, and a
+  check that every row of P sums to 1.
+- **A is 0/1:** tick to give every link weight 1, so A only says who is linked. With the
+  *Triangle + isolated* preset this gives exactly the grids of the `aerie-graph` tests.
+- **Hover a cell** to light up its link on the map and read how the value is made (e.g.
+  `P[1][2] = A[1][2] / D[1][1]`). Hover or select a drone to outline its row and column.
+- Canvas: click to add a drone (role in the left panel), drag to move, right-click or Delete
+  to remove. Presets: triangle + isolated, path of 4, star around a relay, two squads joined
+  by their relays. Sliders for the two radio ranges.
 
 ### Jamming playground
 
