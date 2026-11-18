@@ -189,8 +189,13 @@ from the real functions in `aerie-graph`.
 ### Label propagation playground
 
 Mission 1: choose which drones report their class and watch label propagation
-(`aerie_classic::lp::label_propagation`) spread it over the comm graph.
+(`aerie_classic::lp::label_propagation`) or random walk with restart
+(`aerie_classic::rwr::random_walk_with_restart`) spread it over the comm graph.
 
+- **Method:** *Label propagation* (Y ← P′Y, reporters clamped) or *Random walk with restart*
+  (F ← αPF + (1−α)Y₀, nothing clamped, α slider). Under RWR every drone gets a bar, since the
+  reporters' rows can move too. The right panel shows both methods' converged accuracy side by
+  side.
 - **Drones:** each has a true class. Reporting drones (thick ring, **R**) are the labelled
   rows; silent drones are filled with the class colours mixed by their row of Y, with a small
   bar of Y under them, and an outer ring in their true class. Grey with **?** = no label has
@@ -198,16 +203,19 @@ Mission 1: choose which drones report their class and watch label propagation
 - **Rounds:** slider, ◀ ▶, Play (speed in rounds per second), ⏭ for the converged answer. The
   map and the table show Y after that round; a log plot shows the largest change per round
   against `tol`.
-- **Brush:** *Class k, reports*, *Class k, silent*, or *Switch reports / silent*. Click a drone
-  to paint it, click empty space for a new drone, drag to move, right-click to remove. 2 to 4
-  classes.
-- **Right panel:** accuracy on the silent drones (right, wrong, no guess) and every row of Y
-  with its guess and truth. Hover a row to find the drone.
-- **Matrices tab:** P = D⁻¹A, **P′** (P with each reporter's row replaced by an identity row:
-  that is the clamping), and Y before and after the shown round. Hover a cell of Y(t) to see
-  `Σⱼ P′[i][j] · Y(t−1)[j][c]` with the numbers; the row of P′ and the column of Y(t−1) that
-  go into it light up.
-- **Presets:** two sides joined by a bridge, path of 5, **the silent squad** (experiment 4:
+- **Brush:** *Class k, reports*, *Class k, silent*, *Wrong report: says k* (the drone keeps its
+  true class but reports k), or *Switch reports / silent*. Click a drone to paint it, click
+  empty space for a new drone, drag to move, right-click to remove. 2 to 4 classes.
+- **Right panel:** accuracy on the silent drones and the wrong reporters (right, wrong, no
+  guess) and every row of Y with its guess and truth. Hover a row to find the drone.
+- **Matrices tab:** P = D⁻¹A, then the matrix each round multiplies by: **P′** for label
+  propagation (P with each reporter's row replaced by an identity row: that is the clamping) or
+  **αP** for RWR, plus the restart term **(1−α)Y₀** for RWR, and Y before and after the shown
+  round. Hover a cell of Y(t) to see `Σⱼ P′[i][j] · Y(t−1)[j][c]` (plus the restart cell for
+  RWR) with the numbers; the cells that go into it light up.
+- **Presets:** two sides joined by a bridge, path of 5, **one wrong report** (a west drone
+  reports the east class between three honest reporters: LP keeps the lie, RWR at α = 0.85
+  overrules it; with only one honest reporter nearby the lie wins under RWR too), **the silent squad** (experiment 4:
   a squad with no reporter takes its neighbour's class), random drones split west/east with a
   chosen share reporting.
 

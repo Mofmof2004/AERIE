@@ -4,8 +4,11 @@
 //! Run with `cargo run --release -p aerie-viz --bin lp_playground`.
 //!
 //! - Links: the swarm rule (`epsilon_graph`, D00), Gaussian weights or all 1.
-//! - Each drone has a true class. Reporting drones are labelled with it (thick ring);
-//!   silent drones get their class from `aerie_classic::lp::label_propagation`.
+//! - Each drone has a true class. Reporting drones are labelled with what they report
+//!   (thick ring), usually their true class; the "wrong report" brush makes one lie.
+//! - Two methods: label propagation (`aerie_classic::lp::label_propagation`, reporters
+//!   clamped) and random walk with restart (`aerie_classic::rwr`, F <- aPF + (1-a)Y0,
+//!   nothing clamped, so a lying reporter can be outvoted by its neighbours).
 //! - The round slider (or Play) shows Y after each round: colours mix as the labels
 //!   arrive. The right panel lists every row of Y, the guess, and whether it is right.
 //!
@@ -13,6 +16,7 @@
 //! paint it with the brush; drag to move; right-click (or Delete) to remove.
 
 use aerie_classic::lp::label_propagation;
+use aerie_classic::rwr::random_walk_with_restart;
 use aerie_graph::EdgeList;
 use aerie_viz::grid::{Focus, fmt, matrix_grid, show_tip};
 use eframe::egui::{
@@ -49,6 +53,7 @@ const WRONG: Color32 = Color32::from_rgb(225, 87, 89);
 const P_ACCENT: Color32 = Color32::from_rgb(118, 183, 178);
 const CLAMPED_ACCENT: Color32 = Color32::from_rgb(237, 201, 72);
 const Y_ACCENT: Color32 = Color32::from_rgb(170, 170, 190);
+const RESTART_ACCENT: Color32 = Color32::from_rgb(255, 157, 167);
 /// Rounds shown at most (the slider and the plot).
 const MAX_ROUNDS: usize = 500;
 
@@ -66,6 +71,24 @@ fn main() -> eframe::Result {
     )
 }
 
+/// Which method spreads the labels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Method {
+    /// Label propagation: Y <- P′Y, reporters clamped.
+    Lp,
+    /// Random walk with restart: F <- αPF + (1−α)Y₀, nothing clamped.
+    Rwr,
+}
+
+impl Method {
+    fn name(self) -> &'static str {
+        match self {
+            Method::Lp => "label_propagation",
+            Method::Rwr => "random_walk_with_restart",
+        }
+    }
+}
+
 /// What a click on a drone (or on empty space) does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Brush {
@@ -73,6 +96,8 @@ enum Brush {
     Report(usize),
     /// The drone's true class becomes k but it stays silent.
     Silent(usize),
+    /// Keep its true class, but it reports class k (a wrong report if k ≠ truth).
+    Lie(usize),
     /// Keep its class, switch it between reporting and silent.
     Toggle,
 }
@@ -88,7 +113,10 @@ enum Tab {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Which {
     P,
-    Clamped,
+    /// The matrix each round multiplies by: P′ (label propagation) or αP (RWR).
+    Step,
+    /// (1−α)Y₀, the restart term (RWR only).
+    Restart,
     YPrev,
     Y,
 }
@@ -97,10 +125,18 @@ enum Which {
 #[derive(Debug, Clone)]
 struct Node {
     drone: Drone,
-    /// Its true class (what it would report).
+    /// Its true class.
     truth: usize,
+    /// The class it reports, if it reports: its truth, unless painted with a wrong report.
+    said: usize,
     /// Whether it gets its report through (labelled) or is silent.
     reports: bool,
+}
+
+impl Node {
+    fn lies(&self) -> bool {
+        self.reports && self.said != self.truth
+    }
 }
 
 /// Everything computed from the drones for one frame.
@@ -108,15 +144,19 @@ struct Run {
     graph: EdgeList,
     /// P = D⁻¹A.
     p: Mat<f64>,
-    /// P′: P with every reporting drone's row replaced by an identity row.
-    clamped: Mat<f64>,
+    /// The matrix each round multiplies by: P′ (reporters' rows clamped) or αP.
+    step: Mat<f64>,
+    /// Added each round: zeros for label propagation, (1−α)Y₀ for RWR.
+    restart: Mat<f64>,
     /// Y after round 0 (the one-hots), 1, 2, ... up to the last round.
     ys: Vec<Mat<f64>>,
     /// Largest change of any cell in each round (round 1 first).
     changes: Vec<f64>,
-    /// Final Y and rounds from the real `label_propagation`.
+    /// Final Y and rounds from the real function of the chosen method.
     final_y: Mat<f64>,
     rounds: usize,
+    /// The other method's final Y, for the comparison line.
+    other_y: Mat<f64>,
 }
 
 struct Playground {
@@ -126,6 +166,9 @@ struct Playground {
     binary: bool,
     tol: f64,
     max_iter: usize,
+    method: Method,
+    /// RWR: how much a drone listens to its neighbours (1 − α: to its own report).
+    alpha: f64,
 
     brush: Brush,
     snap: bool,
@@ -169,6 +212,8 @@ impl Default for Playground {
             binary: true,
             tol: 1e-6,
             max_iter: 1000,
+            method: Method::Lp,
+            alpha: 0.85,
             brush: Brush::Report(0),
             snap: true,
             selected: None,
@@ -243,12 +288,27 @@ impl Playground {
         self.nodes.iter().map(|n| n.drone.clone()).collect()
     }
 
-    /// The label slots passed to `label_propagation`: `Some(truth)` for reporting drones.
+    /// The label slots passed to the methods: `Some(what it said)` for reporting drones.
     fn labels(&self) -> Vec<Option<usize>> {
         self.nodes
             .iter()
-            .map(|n| n.reports.then_some(n.truth))
+            .map(|n| n.reports.then_some(n.said))
             .collect()
+    }
+
+    /// The real function of `method`: final Y and rounds.
+    fn solve(&self, method: Method, p: &Mat<f64>, labels: &[Option<usize>]) -> (Mat<f64>, usize) {
+        match method {
+            Method::Lp => label_propagation(p, labels, self.n_classes, self.tol, self.max_iter),
+            Method::Rwr => random_walk_with_restart(
+                p,
+                labels,
+                self.n_classes,
+                self.alpha,
+                self.tol,
+                self.max_iter,
+            ),
+        }
     }
 
     fn graph(&self) -> EdgeList {
@@ -266,19 +326,38 @@ impl Playground {
         let graph = self.graph();
         let p = graph.transition_matrix();
         let labels = self.labels();
-        let (ys, changes) = trajectory(&p, &labels, self.n_classes, self.tol, MAX_ROUNDS);
-        let (final_y, rounds) =
-            label_propagation(&p, &labels, self.n_classes, self.tol, self.max_iter);
-        let clamped = clamp_rows(&p, &labels);
+        let (step, restart) = step_matrices(&p, &labels, self.n_classes, self.method, self.alpha);
+        let (ys, changes) = trajectory(&step, &restart, &labels, self.tol, MAX_ROUNDS);
+        let (final_y, rounds) = self.solve(self.method, &p, &labels);
+        let other = match self.method {
+            Method::Lp => Method::Rwr,
+            Method::Rwr => Method::Lp,
+        };
+        let (other_y, _) = self.solve(other, &p, &labels);
         Run {
             graph,
             p,
-            clamped,
+            step,
+            restart,
             ys,
             changes,
             final_y,
             rounds,
+            other_y,
         }
+    }
+
+    /// Right guesses among the drones scored for `y`: the silent ones, plus the lying
+    /// reporters (can the method overrule a wrong report?). Returns (right, scored).
+    fn score(&self, y: &Mat<f64>) -> (usize, usize) {
+        let scored: Vec<usize> = (0..self.nodes.len())
+            .filter(|&i| !self.nodes[i].reports || self.nodes[i].lies())
+            .collect();
+        let right = scored
+            .iter()
+            .filter(|&&i| guess(y, i) == Some(self.nodes[i].truth))
+            .count();
+        (right, scored.len())
     }
 
     fn place(&self, p: Vec2) -> Vec2 {
@@ -300,6 +379,7 @@ impl Playground {
         self.nodes.push(Node {
             drone: Drone::new(id, SquadId(truth as u16), role, position),
             truth,
+            said: truth,
             reports,
         });
     }
@@ -310,11 +390,17 @@ impl Playground {
         match self.brush {
             Brush::Report(k) => {
                 node.truth = k;
+                node.said = k;
                 node.reports = true;
             }
             Brush::Silent(k) => {
                 node.truth = k;
+                node.said = k;
                 node.reports = false;
+            }
+            Brush::Lie(k) => {
+                node.said = k;
+                node.reports = true;
             }
             Brush::Toggle => node.reports = !node.reports,
         }
@@ -391,6 +477,23 @@ impl Playground {
         self.set(2, &d);
     }
 
+    /// The two sides, but the west has three honest reporters (drones 0, 1, 3) around a
+    /// fourth, drone 2, that reports the east class. LP clamps the lie and spreads it;
+    /// RWR at α = 0.85 lets the honest neighbours outvote it. With only one honest
+    /// reporter nearby, the lie would win under RWR too: its own restart term is larger
+    /// than what its diluted neighbours push back.
+    fn load_wrong_report(&mut self) {
+        self.load_two_sides();
+        for honest in [0, 1, 3] {
+            self.nodes[honest].reports = true;
+        }
+        let liar = &mut self.nodes[2];
+        liar.reports = true;
+        liar.said = 1;
+        self.method = Method::Rwr;
+        self.alpha = 0.85;
+    }
+
     /// Three squads (classes 0, 1, 2). Squads 0 and 1 have a reporter; squad 2 has none
     /// and hangs off squad 1 (Mission 1, experiment 4: the silent squad).
     fn load_silent_squad(&mut self) {
@@ -432,6 +535,29 @@ impl Playground {
     fn controls(&mut self, ui: &mut egui::Ui, run: &Run) {
         ui.heading("Label propagation");
         ui.weak("Mission 1: spread the few reports over the comm graph.");
+        ui.add_space(6.0);
+
+        // Method.
+        ui.label(RichText::new("Method").strong());
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.method, Method::Lp, "Label propagation")
+                .on_hover_text("Y ← P′Y: reporters clamped, they never change.");
+            ui.selectable_value(&mut self.method, Method::Rwr, "Random walk with restart")
+                .on_hover_text("F ← αPF + (1−α)Y₀: nothing clamped.");
+        });
+        if self.method == Method::Rwr {
+            ui.add(egui::Slider::new(&mut self.alpha, 0.0..=0.99).text("α"))
+                .on_hover_text(
+                    "α: how much a drone listens to its neighbours each round. \
+                     1 − α: how much it goes back to its own report (zero if silent).",
+                );
+            ui.weak(
+                "Walker view: start at drone i, stop with chance 1 − α each step, else move \
+                 to a neighbour. F[i][c] = chance it stops on a drone that reported c.",
+            );
+        } else {
+            ui.weak("Reporters only listen to themselves; silent drones average.");
+        }
         ui.add_space(6.0);
 
         // Rounds.
@@ -490,8 +616,11 @@ impl Playground {
                 .text("rounds / s"),
         );
         ui.weak(format!(
-            "label_propagation stopped after {} rounds (tol {:.0e}, max {}).",
-            run.rounds, self.tol, self.max_iter
+            "{} stopped after {} rounds (tol {:.0e}, max {}).",
+            self.method.name(),
+            run.rounds,
+            self.tol,
+            self.max_iter
         ));
 
         ui.separator();
@@ -515,14 +644,24 @@ impl Playground {
                 );
             });
         }
+        ui.horizontal(|ui| {
+            ui.label("Wrong report:");
+            for k in 0..self.n_classes {
+                ui.radio_value(&mut self.brush, Brush::Lie(k), format!("says {k}"))
+                    .on_hover_text(format!(
+                        "The drone keeps its true class but reports class {k}."
+                    ));
+            }
+        });
         ui.radio_value(&mut self.brush, Brush::Toggle, "Switch reports / silent");
         ui.add(egui::Slider::new(&mut self.n_classes, 2..=MAX_CLASSES).text("classes"));
         // Drones whose class no longer exists move to the last class.
         let top = self.n_classes - 1;
         for n in &mut self.nodes {
             n.truth = n.truth.min(top);
+            n.said = n.said.min(top);
         }
-        if let Brush::Report(k) | Brush::Silent(k) = &mut self.brush {
+        if let Brush::Report(k) | Brush::Silent(k) | Brush::Lie(k) = &mut self.brush {
             *k = (*k).min(top);
         }
         ui.checkbox(&mut self.snap, "Snap to 0.5 km");
@@ -564,6 +703,17 @@ impl Playground {
             self.load_path();
         }
         if ui
+            .button("One wrong report")
+            .on_hover_text(
+                "Drone 2 is west (class 0) but reports 1, between three honest reporters. \
+                 Switch the method: LP keeps the lie, RWR overrules it. Then try fewer \
+                 honest reporters, or move α.",
+            )
+            .clicked()
+        {
+            self.load_wrong_report();
+        }
+        if ui
             .button("The silent squad")
             .on_hover_text("Experiment 4: squad 2 has no reporter. What does it get?")
             .clicked()
@@ -594,27 +744,44 @@ impl Playground {
         let n = self.nodes.len();
         ui.heading(format!("Y after round {}", self.round));
 
-        // Accuracy on the silent drones, at this round.
-        let silent: Vec<usize> = (0..n).filter(|&i| !self.nodes[i].reports).collect();
+        // Accuracy on the silent drones (and lying reporters), at this round.
+        let silent = (0..n).filter(|&i| !self.nodes[i].reports).count();
+        let liars = (0..n).filter(|&i| self.nodes[i].lies()).count();
         let guesses: Vec<Option<usize>> = (0..n).map(|i| guess(y, i)).collect();
-        let right = silent
-            .iter()
-            .filter(|&&i| guesses[i] == Some(self.nodes[i].truth))
+        let (right, scored) = self.score(y);
+        let none = (0..n)
+            .filter(|&i| !self.nodes[i].reports && guesses[i].is_none())
             .count();
-        let none = silent.iter().filter(|&&i| guesses[i].is_none()).count();
+        let pct = |r: usize, s: usize| 100.0 * r as f64 / s.max(1) as f64;
         ui.label(format!(
-            "{} reporting, {} silent · right {right} of {} ({:.0} %) · no guess {none}",
-            n - silent.len(),
-            silent.len(),
-            silent.len(),
-            100.0 * right as f64 / silent.len().max(1) as f64
+            "{} reporting ({liars} wrong), {silent} silent · right {right} of {scored} \
+             ({:.0} %) · no guess {none}",
+            n - silent,
+            pct(right, scored)
+        ));
+        if liars > 0 {
+            ui.weak("Scored: the silent drones and the wrong reporters (is the lie overruled?).");
+        }
+        let (lp_y, rwr_y) = match self.method {
+            Method::Lp => (&run.final_y, &run.other_y),
+            Method::Rwr => (&run.other_y, &run.final_y),
+        };
+        let (lp_r, lp_s) = self.score(lp_y);
+        let (rwr_r, rwr_s) = self.score(rwr_y);
+        ui.label(format!(
+            "Converged: label propagation {lp_r}/{lp_s} ({:.0} %) · RWR α = {:.2}: \
+             {rwr_r}/{rwr_s} ({:.0} %)",
+            pct(lp_r, lp_s),
+            self.alpha,
+            pct(rwr_r, rwr_s)
         ));
         let same = (0..n).all(|i| {
             (0..self.n_classes)
                 .all(|c| (run.final_y[(i, c)] - run.ys.last().unwrap()[(i, c)]).abs() < 1e-9)
         });
         ui.weak(format!(
-            "Last round matches label_propagation: {}",
+            "Last round matches {}: {}",
+            self.method.name(),
             if same {
                 "yes"
             } else {
@@ -651,10 +818,16 @@ impl Playground {
                 let node = &self.nodes[i];
                 let mut cells = Vec::new();
                 cells.push(ui.label(format!("{i}")));
-                cells.push(if node.reports {
+                cells.push(if node.lies() {
                     ui.label(
-                        RichText::new(format!("reports {}", node.truth))
-                            .color(CLASS_COLORS[node.truth])
+                        RichText::new(format!("says {} (wrong)", node.said))
+                            .color(CLASS_COLORS[node.said])
+                            .strong(),
+                    )
+                } else if node.reports {
+                    ui.label(
+                        RichText::new(format!("reports {}", node.said))
+                            .color(CLASS_COLORS[node.said])
                             .strong(),
                     )
                 } else {
@@ -671,7 +844,7 @@ impl Playground {
                     Some(c) => ui.label(RichText::new(format!("{c}")).color(CLASS_COLORS[c])),
                     None => ui.weak("—"),
                 });
-                let mark = if node.reports {
+                let mark = if node.reports && !node.lies() {
                     ui.label(format!("{}", node.truth))
                 } else if guesses[i] == Some(node.truth) {
                     ui.colored_label(RIGHT, format!("{} ✓", node.truth))
@@ -707,7 +880,7 @@ impl Playground {
             .enumerate()
             .map(|(i, node)| {
                 if node.reports {
-                    (format!("{i}R"), CLASS_COLORS[node.truth])
+                    (format!("{i}R"), CLASS_COLORS[node.said])
                 } else {
                     (i.to_string(), weak)
                 }
@@ -746,41 +919,101 @@ impl Playground {
             show_tip(resp, &text);
         }
 
-        // P′.
+        // The step matrix: P′ or αP.
+        let rwr = self.method == Method::Rwr;
+        let (m_name, y_name) = if rwr { ("αP", "F") } else { ("P′", "Y") };
         ui.add_space(8.0);
-        ui.label(
-            RichText::new("P′ = P with the reporters' rows clamped")
-                .strong()
-                .color(CLAMPED_ACCENT),
-        );
-        ui.weak("A reporting drone only listens to itself: 1 on the diagonal, 0 elsewhere.");
+        if rwr {
+            ui.label(
+                RichText::new(format!("αP = {:.2} × P", self.alpha))
+                    .strong()
+                    .color(CLAMPED_ACCENT),
+            );
+            ui.weak(
+                "Nothing is clamped: every drone, reporting or not, listens to its neighbours.",
+            );
+        } else {
+            ui.label(
+                RichText::new("P′ = P with the reporters' rows clamped")
+                    .strong()
+                    .color(CLAMPED_ACCENT),
+            );
+            ui.weak("A reporting drone only listens to itself: 1 on the diagonal, 0 elsewhere.");
+        }
         let (h, resp) = matrix_grid(
             ui,
-            &run.clamped,
+            &run.step,
             &drones,
             &drones,
-            focus_for(Which::Clamped, prev),
+            focus_for(Which::Step, prev),
             CLAMPED_ACCENT,
             Some("Σ"),
         );
         if let Some((i, j)) = h {
-            now = Some((Which::Clamped, i, j));
-            let text = if self.nodes[i].reports {
+            now = Some((Which::Step, i, j));
+            let text = if rwr {
+                if run.step[(i, j)] == 0.0 {
+                    format!("αP[{i}][{j}] = 0: drone {i} does not listen to {j}.")
+                } else {
+                    format!(
+                        "αP[{i}][{j}] = {:.2} × {} = {}: the share of drone {i}'s new row \
+                         taken from {j}.",
+                        self.alpha,
+                        fmt(run.p[(i, j)]),
+                        fmt(run.step[(i, j)])
+                    )
+                }
+            } else if self.nodes[i].reports {
                 format!("Drone {i} reports: P′[{i}][{i}] = 1, so its row of Y never changes.")
-            } else if run.clamped[(i, j)] == 0.0 {
+            } else if run.step[(i, j)] == 0.0 {
                 format!("P′[{i}][{j}] = 0: drone {i} does not listen to {j}.")
             } else {
                 format!(
                     "P′[{i}][{j}] = P[{i}][{j}] = {}: drone {i} is silent, it averages.",
-                    fmt(run.clamped[(i, j)])
+                    fmt(run.step[(i, j)])
                 )
             };
             show_tip(resp, &text);
         }
 
+        // The restart term (RWR).
+        if rwr {
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(format!("(1−α)Y₀ = {:.2} × Y₀", 1.0 - self.alpha))
+                    .strong()
+                    .color(RESTART_ACCENT),
+            );
+            ui.weak("Added every round: each reporter is pulled back to what it said.");
+            let (h, resp) = matrix_grid(
+                ui,
+                &run.restart,
+                &drones,
+                &classes,
+                focus_for(Which::Restart, prev),
+                RESTART_ACCENT,
+                Some("Σ"),
+            );
+            if let Some((i, c)) = h {
+                now = Some((Which::Restart, i, c));
+                show_tip(
+                    resp,
+                    &format!(
+                        "(1−α)Y₀[{i}][c{c}] = {}: {}",
+                        fmt(run.restart[(i, c)]),
+                        if self.nodes[i].reports {
+                            format!("drone {i} said {}.", self.nodes[i].said)
+                        } else {
+                            format!("drone {i} is silent, it has nothing to go back to.")
+                        }
+                    ),
+                );
+            }
+        }
+
         if t == 0 {
             ui.add_space(8.0);
-            ui.label(RichText::new("Y after round 0").strong());
+            ui.label(RichText::new(format!("{y_name} after round 0")).strong());
             ui.weak("One-hot rows for the reporters, zeros for the silent drones.");
             let (h, _) = matrix_grid(
                 ui,
@@ -794,11 +1027,15 @@ impl Playground {
             if let Some((i, c)) = h {
                 now = Some((Which::Y, i, c));
             }
-            ui.weak("Step the round slider to see Y(1) = P′ × Y(0).");
+            ui.weak(if rwr {
+                "Step the round slider to see F(1) = αP × F(0) + (1−α)Y₀."
+            } else {
+                "Step the round slider to see Y(1) = P′ × Y(0)."
+            });
         } else {
             let (y_prev, y) = (&run.ys[t - 1], &run.ys[t]);
             ui.add_space(8.0);
-            ui.label(RichText::new(format!("Y after round {}", t - 1)).strong());
+            ui.label(RichText::new(format!("{y_name} after round {}", t - 1)).strong());
             let (h, resp) = matrix_grid(
                 ui,
                 y_prev,
@@ -813,7 +1050,8 @@ impl Playground {
                 show_tip(
                     resp,
                     &format!(
-                        "Y{}[{j}][c{c}] = {}: drone {j}'s belief in class {c} before round {t}.",
+                        "{y_name}{}[{j}][c{c}] = {}: drone {j}'s belief in class {c} before \
+                         round {t}.",
                         t - 1,
                         fmt(y_prev[(j, c)])
                     ),
@@ -821,10 +1059,18 @@ impl Playground {
             }
 
             ui.add_space(8.0);
+            let restart_part = if rwr { " + (1−α)Y₀" } else { "" };
             ui.label(
-                RichText::new(format!("Y after round {t} = P′ × Y after round {}", t - 1)).strong(),
+                RichText::new(format!(
+                    "{y_name} after round {t} = {m_name} × {y_name} after round {}{restart_part}",
+                    t - 1
+                ))
+                .strong(),
             );
-            ui.weak("Hover a cell: row i of P′ times column c of the Y above.");
+            ui.weak(format!(
+                "Hover a cell: row i of {m_name} times column c of the {y_name} above{}.",
+                if rwr { ", plus the restart cell" } else { "" }
+            ));
             let (h, resp) = matrix_grid(
                 ui,
                 y,
@@ -836,19 +1082,26 @@ impl Playground {
             );
             if let Some((i, c)) = h {
                 now = Some((Which::Y, i, c));
-                let terms: Vec<String> = (0..n)
-                    .filter(|&j| run.clamped[(i, j)] != 0.0)
-                    .map(|j| format!("{}·{}", fmt(run.clamped[(i, j)]), fmt(y_prev[(j, c)])))
+                let mut terms: Vec<String> = (0..n)
+                    .filter(|&j| run.step[(i, j)] != 0.0)
+                    .map(|j| format!("{}·{}", fmt(run.step[(i, j)]), fmt(y_prev[(j, c)])))
                     .collect();
                 let used: Vec<String> = (0..n)
-                    .filter(|&j| run.clamped[(i, j)] != 0.0)
+                    .filter(|&j| run.step[(i, j)] != 0.0)
                     .map(|j| j.to_string())
                     .collect();
-                let text = if terms.is_empty() {
-                    format!("Y{t}[{i}][c{c}] = 0: drone {i} has no row in P′.")
+                let restart = if rwr {
+                    terms.push(fmt(run.restart[(i, c)]));
+                    format!(" + (1−α)Y₀[{i}][c{c}]")
+                } else {
+                    String::new()
+                };
+                let text = if used.is_empty() {
+                    format!("{y_name}{t}[{i}][c{c}] = 0: drone {i} has no row in {m_name}.")
                 } else {
                     format!(
-                        "Y{t}[{i}][c{c}] = Σⱼ P′[{i}][j] · Y{}[j][c{c}]  (j = {})\n= {} = {}",
+                        "{y_name}{t}[{i}][c{c}] = Σⱼ {m_name}[{i}][j] · {y_name}{}[j][c{c}]{restart}  \
+                         (j = {})\n= {} = {}",
                         t - 1,
                         used.join(", "),
                         terms.join(" + "),
@@ -862,7 +1115,7 @@ impl Playground {
         self.mat_hover = now;
         // A hovered row is a drone: outline it on the map.
         self.hover_row = now.map(|(w, i, j)| match w {
-            Which::YPrev | Which::P | Which::Clamped | Which::Y if i < n => i,
+            Which::YPrev | Which::P | Which::Step | Which::Restart | Which::Y if i < n => i,
             _ => j,
         });
     }
@@ -925,9 +1178,14 @@ impl Playground {
                     let (truth, reports) = match self.brush {
                         Brush::Report(k) => (k, true),
                         Brush::Silent(k) => (k, false),
-                        Brush::Toggle => (0, false),
+                        Brush::Lie(_) | Brush::Toggle => (0, false),
                     };
                     self.add(Role::Recon, pos, truth, reports);
+                    if let Brush::Lie(k) = self.brush {
+                        let n = self.nodes.last_mut().unwrap();
+                        n.reports = true;
+                        n.said = k;
+                    }
                     self.selected = Some(self.nodes.len() - 1);
                     changed = true;
                 }
@@ -1025,7 +1283,7 @@ impl Playground {
             }
             let c = t.to_screen(node.drone.position);
             let fill = row_color(y, i, self.n_classes);
-            if self.show_truth && !node.reports {
+            if self.show_truth && (!node.reports || node.lies()) {
                 painter.circle_stroke(
                     c,
                     NODE_PX + 4.0,
@@ -1057,7 +1315,8 @@ impl Playground {
                     Color32::WHITE,
                 );
             }
-            if self.show_bars && !node.reports {
+            // Silent drones, and every drone under RWR (reporters' rows can move too).
+            if self.show_bars && (!node.reports || self.method == Method::Rwr) {
                 let r = Rect::from_center_size(c + vec2(0.0, NODE_PX + 8.0), vec2(26.0, 5.0));
                 draw_bar(&painter, r, y, i, self.n_classes);
             }
@@ -1096,12 +1355,18 @@ impl Playground {
             response.on_hover_ui_at_pointer(|ui| {
                 ui.strong(format!(
                     "Drone {i} · {}",
-                    if node.reports { "reports" } else { "silent" }
+                    if node.lies() {
+                        format!("reports {} (wrong)", node.said)
+                    } else if node.reports {
+                        format!("reports {}", node.said)
+                    } else {
+                        "silent".to_string()
+                    }
                 ));
                 ui.label(format!("Y row: [{}]", values.join(", ")));
                 ui.label(format!("True class: {}", node.truth));
                 match guess(y, i) {
-                    Some(c) if !node.reports => {
+                    Some(c) if !node.reports || node.lies() => {
                         ui.label(format!(
                             "Guess: {c} ({})",
                             if c == node.truth { "right" } else { "wrong" }
@@ -1134,7 +1399,7 @@ fn clamp_rows(p: &Mat<f64>, labels: &[Option<usize>]) -> Mat<f64> {
 
 /// What to outline in matrix `target` when a cell of another one is hovered, so the
 /// cells that go into the product light up together:
-/// Y(t)[i][c] = row i of P′ · column c of Y(t−1).
+/// Y(t)[i][c] = row i of the step matrix · column c of Y(t−1) (+ restart[i][c]).
 fn focus_for(target: Which, hover: Option<(Which, usize, usize)>) -> Focus {
     let mut f = Focus::default();
     let Some((w, i, j)) = hover else {
@@ -1142,41 +1407,62 @@ fn focus_for(target: Which, hover: Option<(Which, usize, usize)>) -> Focus {
     };
     match (w, target) {
         (a, b) if a == b => f.cell = Some((i, j)),
-        (Which::Y, Which::Clamped) => f.row = Some(i),
+        (Which::Y, Which::Step) => f.row = Some(i),
         (Which::Y, Which::YPrev) => f.col = Some(j),
-        (Which::Clamped, Which::P) | (Which::P, Which::Clamped) => f.cell = Some((i, j)),
-        (Which::Clamped, Which::YPrev) => f.row = Some(j),
-        (Which::Clamped, Which::Y) => f.row = Some(i),
-        (Which::YPrev, Which::Clamped) => f.col = Some(i),
+        (Which::Y, Which::Restart) | (Which::Restart, Which::Y) => f.cell = Some((i, j)),
+        (Which::Step, Which::P) | (Which::P, Which::Step) => f.cell = Some((i, j)),
+        (Which::Step, Which::YPrev) => f.row = Some(j),
+        (Which::Step, Which::Y) => f.row = Some(i),
+        (Which::YPrev, Which::Step) => f.col = Some(i),
         (Which::YPrev, Which::Y) => f.col = Some(j),
         _ => {}
     }
     f
 }
 
-/// Y after every round, from round 0 (the one-hots) until no cell moves by more than
-/// `tol`, or `max_rounds`. The same steps as `label_propagation` (a test checks that
-/// they agree round by round), kept here so the slider can show every round.
-/// Also returns the largest change in each round.
-fn trajectory(
-    p: &Mat<f64>,
-    labels: &[Option<usize>],
-    n_classes: usize,
-    tol: f64,
-    max_rounds: usize,
-) -> (Vec<Mat<f64>>, Vec<f64>) {
-    let n = p.nrows();
-    let clamped = clamp_rows(p, labels);
+/// Y₀: a one-hot row for each labelled drone, zeros for the silent ones.
+fn one_hots(n: usize, labels: &[Option<usize>], n_classes: usize) -> Mat<f64> {
     let mut y: Mat<f64> = Mat::zeros(n, n_classes);
     for (i, label) in labels.iter().enumerate() {
         if let Some(c) = label {
             y[(i, *c)] = 1.0;
         }
     }
-    let mut ys = vec![y];
+    y
+}
+
+/// One round is Y ← step × Y + restart. Label propagation: step = P′, restart = 0.
+/// RWR: step = αP, restart = (1−α)Y₀.
+fn step_matrices(
+    p: &Mat<f64>,
+    labels: &[Option<usize>],
+    n_classes: usize,
+    method: Method,
+    alpha: f64,
+) -> (Mat<f64>, Mat<f64>) {
+    let n = p.nrows();
+    match method {
+        Method::Lp => (clamp_rows(p, labels), Mat::zeros(n, n_classes)),
+        Method::Rwr => (alpha * p, (1.0 - alpha) * &one_hots(n, labels, n_classes)),
+    }
+}
+
+/// Y after every round, from round 0 (the one-hots) until no cell moves by more than
+/// `tol`, or `max_rounds`: Y ← step × Y + restart. The same steps as the real functions
+/// (a test checks that they agree round by round), kept here so the slider can show
+/// every round. Also returns the largest change in each round.
+fn trajectory(
+    step: &Mat<f64>,
+    restart: &Mat<f64>,
+    labels: &[Option<usize>],
+    tol: f64,
+    max_rounds: usize,
+) -> (Vec<Mat<f64>>, Vec<f64>) {
+    let (n, n_classes) = (restart.nrows(), restart.ncols());
+    let mut ys = vec![one_hots(n, labels, n_classes)];
     let mut changes = Vec::new();
     for _ in 0..max_rounds {
-        let next = &clamped * ys.last().unwrap();
+        let next = step * ys.last().unwrap() + restart;
         let prev = ys.last().unwrap();
         let mut change = 0.0_f64;
         for i in 0..n {
@@ -1381,7 +1667,8 @@ mod tests {
             load(&mut p);
             let pm = p.graph().transition_matrix();
             let labels = p.labels();
-            let (ys, changes) = trajectory(&pm, &labels, p.n_classes, p.tol, MAX_ROUNDS);
+            let (step, restart) = step_matrices(&pm, &labels, p.n_classes, Method::Lp, 0.0);
+            let (ys, changes) = trajectory(&step, &restart, &labels, p.tol, MAX_ROUNDS);
             assert_eq!(ys.len(), changes.len() + 1);
             for (t, expected) in ys.iter().enumerate().take(30).skip(1) {
                 let (y, rounds) = label_propagation(&pm, &labels, p.n_classes, p.tol, t);
@@ -1407,21 +1694,64 @@ mod tests {
                 } else {
                     run.p[(i, j)]
                 };
-                assert_eq!(run.clamped[(i, j)], want, "({i}, {j})");
+                assert_eq!(run.step[(i, j)], want, "({i}, {j})");
             }
         }
         // Each shown round is P′ times the one before.
         for t in 1..run.ys.len().min(10) {
-            let product = &run.clamped * &run.ys[t - 1];
+            let product = &run.step * &run.ys[t - 1];
             assert!(same(&product, &run.ys[t]), "round {t}");
         }
     }
 
     #[test]
+    fn trajectory_matches_rwr_round_by_round() {
+        // Same check for random walk with restart, at a few values of α.
+        let mut p = Playground::default();
+        for load in [
+            Playground::load_two_sides,
+            Playground::load_wrong_report,
+            Playground::load_silent_squad,
+            Playground::load_random,
+        ] {
+            load(&mut p);
+            for alpha in [0.5, 0.85, 0.99] {
+                let pm = p.graph().transition_matrix();
+                let labels = p.labels();
+                let (step, restart) = step_matrices(&pm, &labels, p.n_classes, Method::Rwr, alpha);
+                let (ys, _) = trajectory(&step, &restart, &labels, p.tol, 5000);
+                for (t, expected) in ys.iter().enumerate().take(30).skip(1) {
+                    let (y, rounds) =
+                        random_walk_with_restart(&pm, &labels, p.n_classes, alpha, p.tol, t);
+                    assert_eq!(rounds, t);
+                    assert!(same(&y, expected), "α {alpha}, round {t}");
+                }
+                let (y, rounds) =
+                    random_walk_with_restart(&pm, &labels, p.n_classes, alpha, p.tol, 5000);
+                assert_eq!(rounds, ys.len() - 1, "α {alpha}");
+                assert!(same(&y, ys.last().unwrap()), "α {alpha}");
+            }
+        }
+    }
+
+    #[test]
+    fn rwr_overrules_the_wrong_report_and_lp_keeps_it() {
+        let mut p = Playground::default();
+        p.load_wrong_report();
+        assert!(p.nodes[2].lies());
+        let run = p.run();
+        assert_eq!(p.method, Method::Rwr);
+        assert_eq!(guess(&run.final_y, 2), Some(0), "RWR: the neighbours win");
+        assert_eq!(guess(&run.other_y, 2), Some(1), "LP: the lie is clamped");
+        assert!(p.score(&run.final_y).0 > p.score(&run.other_y).0);
+    }
+
+    #[test]
     fn hovering_y_lights_up_the_row_of_p_prime_and_the_column_of_y_before() {
         let hover = Some((Which::Y, 3, 1));
-        assert_eq!(focus_for(Which::Clamped, hover).row, Some(3));
+        assert_eq!(focus_for(Which::Step, hover).row, Some(3));
         assert_eq!(focus_for(Which::YPrev, hover).col, Some(1));
+        assert_eq!(focus_for(Which::Restart, hover).cell, Some((3, 1)));
         assert_eq!(focus_for(Which::Y, hover).cell, Some((3, 1)));
         assert_eq!(focus_for(Which::P, hover), Focus::default());
     }
