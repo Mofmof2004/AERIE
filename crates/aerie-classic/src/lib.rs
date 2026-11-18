@@ -3,3 +3,4 @@
 //! - `lp`: label propagation and random walk with restart (Mission 1).
 
 pub mod lp;
+pub mod rwr;
