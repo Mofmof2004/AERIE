@@ -10,7 +10,7 @@ Design decisions and the evidence behind them are in [DECISIONS.md](DECISIONS.md
 ```
 AERIE/
 ├── Cargo.toml              workspace: members, shared dependency versions
-├── DECISIONS.md            decision log: D00 ground rules, D01 epsilon-graph tuning, D02 jamming, ...
+├── DECISIONS.md            decision log: D00 ground rules, D01 ε tuning, D02 jamming, D03 link model, D04 tasks/oracle, D05 label propagation
 ├── RUST_NOTES.md           Rust questions and compiler mistakes, raw material for a cheat sheet
 ├── results/                experiment output, one folder per mission (runs.csv not committed)
 ├── crates/
@@ -32,14 +32,17 @@ AERIE/
 │   │           └── stats.rs   stats(): mean degree, components, cross-squad share
 │   ├── aerie-classic/      classical methods, no training (Mission 1)
 │   │   ├── examples/m1.rs  the Mission 1 runner: every method × graph × label × share, test seeds × 20 draws
+│   │   ├── examples/m2.rs  the Mission 2 runner: DeepWalk, Node2Vec (q = 0.5, 2) + baselines on the 300-drone traffic graph
 │   │   └── src/
 │   │       ├── lp.rs       label_propagation (iterated) and label_propagation_closed_form
 │   │       ├── rwr.rs      random_walk_with_restart (iterated) and its closed form
 │   │       ├── baselines.rs majority_class, nearest_reporter (hops), nearest_reporter_by_distance (km)
 │   │       ├── eval.rs     Method, Problem, draw_reporters, hide, guesses, Score, score
-│   │       └── m1.rs       the Mission 1 experiment: LabelKind, GraphKind, sweep (seeds in parallel), CSV, tables
-│   └── aerie-viz/          GUIs (egui): one binary per GUI in src/bin/; shared map.rs, m1_view.rs (Mission 1 view), m1_plot.rs (results plot)
-│       └── src/bin/        swarm_viewer.rs, graph_playground.rs, jamming_playground.rs, matrix_playground.rs, lp_playground.rs, m1_results.rs
+│   │       ├── m1.rs       the Mission 1 experiment: LabelKind, GraphKind, sweep (seeds in parallel), CSV, tables
+│   │       ├── m2.rs       the Mission 2 experiment: run_seed (DeepWalk, Node2Vec at each (p, q), three scores, baselines), sweep, CSV
+│   │       └── embed/      Mission 2 embeddings: walks.rs (random_walks), skipgram.rs (pair_loss_and_grads, train_skipgram), deepwalk.rs (deepwalk), node2vec.rs (biased_walks, node2vec), score.rs (role F1, link AUC, squad NMI)
+│   └── aerie-viz/          GUIs (egui): one binary per GUI in src/bin/; shared map.rs, m1_view.rs (Mission 1 view), m1_plot.rs (results plot), m2_view.rs (Mission 2 view, chart, runner)
+│       └── src/bin/        swarm_viewer.rs, graph_playground.rs, jamming_playground.rs, matrix_playground.rs, lp_playground.rs, m1_results.rs, m2_results.rs, skipgram_playground.rs, node2vec_playground.rs
 └── target/                 build output (not committed)
 ```
 
@@ -74,7 +77,8 @@ Small programs in `crates/swarmsim/examples/`. Run with `--release`.
 | ε-graph stats | `cargo run --release -p swarmsim --example epsilon_stats` | one row per seed: links, mean degree, components, largest, isolated, share between squads; then the mean and the targets (D01) |
 | Link stats | `cargo run --release -p swarmsim --example link_stats` | link-model calibration (D03): for several N0 and scale settings, links lost, live degree, far links kept, zone links kept, splits, stranded drones, one-way counts |
 | Jamming stats | `cargo run --release -p swarmsim --example jamming_stats` | step 2 end to end, one row per seed: jammed share, relays jammed, links lost, pieces, stranded drones, readings on the wrong side; then the summary (D02) |
-| Mission 1 runner | `cargo run --release -p aerie-classic --example m1` | about 45 s (seeds in parallel). The swarm viewer's Mission 1 view runs the same sweep with a button. Every method (majority, nearest km, nearest hops, LP, RWR α 0.85) on every graph (live, ε, kNN), for every label (zone, squad, role), report share (1 % to 50 %) and share of wrong reports (0, 10, 25 % of the reporters say a wrong class), test seeds 90–99 × 20 draws. Prints the main table (live graph, 10 %), experiment 1 and the wrong-reports tables (accuracy, and the share of lies each method overruled); writes `results/m1/runs.csv` and `results/m1/summary.csv`. No guess counts as wrong. |
+| Mission 1 runner | `cargo run --release -p aerie-classic --example m1` | about 1 minute (seeds in parallel). The swarm viewer's Mission 1 view runs the same sweep with a button. Every method (majority, nearest km, nearest hops, LP, RWR α 0.85) on every graph (live, ε, kNN), for every label (zone, squad, role), report share (1 % to 50 %) and share of wrong reports (0, 10, 25, 40 % of the reporters say a wrong class), test seeds 90–99 × 20 draws. Prints the main table (live graph, 10 %), experiment 1 and the wrong-reports tables (accuracy, and the share of lies each method overruled); writes `results/m1/runs.csv` and `results/m1/summary.csv`. No guess counts as wrong. |
+| Mission 2 runner | `cargo run --release -p aerie-classic --example m2` | about 5 seconds (seeds in parallel). The swarm viewer's Mission 2 view runs the same with a button. DeepWalk and Node2Vec at p = 1, q = 0.5 and q = 2 (experiment 1; default walk and skip-gram settings) on the 300-drone traffic graph, test seeds 90–99, scored three ways: role macro-F1 (5-fold logistic regression), link AUC (10 % of the links hidden before training), squad NMI (k-means, k = 30). Baselines: random vectors, traffic counts (sent, received, partners; role only), majority class. Prints the table and the training pairs per epoch; writes `results/m2/embeddings.csv`. |
 
 ## GUIs
 
@@ -89,6 +93,9 @@ Always use `--release` for the GUIs: they are much smoother.
 | Matrix playground | `cargo run --release -p aerie-viz --bin matrix_playground` |
 | Label propagation playground | `cargo run --release -p aerie-viz --bin lp_playground` |
 | Mission 1 results | `cargo run --release -p aerie-viz --bin m1_results` |
+| Mission 2 results | `cargo run --release -p aerie-viz --bin m2_results` |
+| Skip-gram playground | `cargo run --release -p aerie-viz --bin skipgram_playground` |
+| Node2Vec playground | `cargo run --release -p aerie-viz --bin node2vec_playground` |
 
 ### Swarm viewer
 
@@ -258,14 +265,16 @@ Pick **M1 First Contact** in the mission menu of the swarm viewer.
   selected drone's guess under each method.
 - **Bottom:** *Run the experiment*: the full sweep (test seeds 90–99 × 20 draws, every
   method × graph × label × share, with the current settings and α) on a background thread
-  with a progress bar, about 45 s. The plot and table have a *Wrong reports* selector (0, 10,
-  25 %); with wrong reports the table also shows the share of lies each method overruled. It writes `results/m1/` and shows the plot and the table
+  with a progress bar, about 1 minute. The plot's x-axis is either the **share of wrong
+  reports** (0 to 40 %, at a chosen report share: the default, it shows the baselines falling
+  faster than LP and RWR) or the report share (at a chosen wrong share). With wrong reports the
+  table also shows the share of lies each method overruled. It writes `results/m1/` and shows the plot and the table
   below. A test checks that the map's scores are the experiment's scores for the same run.
 
 ### Mission 1 results
 
 The same plot and table as the swarm viewer's Mission 1 view, on their own, from
-`results/m1/summary.csv`. *Run the experiment* runs the sweep (about 45 s, default settings).
+`results/m1/summary.csv`. *Run the experiment* runs the sweep (about 1 minute, default settings).
 
 - **Plot:** accuracy on the silent drones against the share of drones that report (log scale).
   Colour = method, line style = graph (live solid, ε dashed, kNN dotted), with an optional
@@ -274,6 +283,107 @@ The same plot and table as the swarm viewer's Mission 1 view, on their own, from
 - **Left:** the label (zone, squad, role), the graphs and the methods to show.
 - **Table:** every method on every graph at one share: accuracy ± sd (no-guess share); the best
   graph per method in bold.
+
+### Swarm viewer, Mission 2 view
+
+Pick *M2 Fingerprints* in the mission list. On the first visit the viewer switches to the plan's
+300-drone swarm (30 squads, 70 × 35 km) if the settings are still the defaults; a button brings it
+back otherwise. Each seed is embedded on a background thread (about a second in release): DeepWalk
+on the full traffic graph, then the three tests of `aerie_classic::m2::run_seed`, exactly as the
+runner does.
+
+- **Left:** DeepWalk's settings (walks per drone, walk length, dimension, window, negatives,
+  epochs, learning rate; *Plan's settings* resets them), Node2Vec's p and q (same walk and
+  skip-gram settings; it runs next to DeepWalk), *Map uses* DeepWalk or Node2Vec, and what the
+  map shows: **k-means
+  clusters of Z** (each cluster in the colour of the squad most of its drones belong to; ring =
+  true squad; cross = the drone's cluster is led by another squad), true squads, **role guessed
+  from Z** or **from the traffic counts** (ring = true role, cross = wrong guess), true roles.
+  *Hidden links of the link test* draws the 10 % of links the second DeepWalk run didn't see,
+  dashed, from red (scored below every never-talked pair) to green (above them all).
+- **Map:** the traffic graph, width = log of the messages. Hover a drone: squad, cluster, role,
+  both role guesses, messages sent and received, partners.
+- **Right:** this seed's role F1, link AUC and squad NMI for DeepWalk and the baselines, how many
+  drones sit in a cluster led by their own squad, and for the selected drone its 8 nearest
+  vectors by cosine (squad, role; click one to select it).
+- **Bottom:** *Run the experiment*: test seeds 90–99 with the current swarm and walk settings,
+  DeepWalk, Node2Vec at p = 1 with q = 0.5 and q = 2 (and at the p, q of the sliders),
+  seeds in parallel, a few seconds. Bar chart of the three scores per method (whiskers = spread
+  over seeds), the table, and the per-seed rows. Writes `results/m2/embeddings.csv`.
+
+### Mission 2 results
+
+The same chart and table on their own, from `results/m2/embeddings.csv`. *Run the experiment*
+runs the plan's setup: 300 drones, default walk settings, DeepWalk and Node2Vec at q = 0.5
+and q = 2.
+
+### Skip-gram playground
+
+Watch DeepWalk (`random_walks` + skip-gram with negative sampling) learn, one training pair at a
+time. The trainer runs the exact loop of `train_skipgram` and calls `pair_loss_and_grads`; when
+training ends it re-runs `train_skipgram` and shows ✔ if both give the same Z.
+
+- **Left:** graph presets (two groups + bridge, three groups, ring, path, grid, star + chain,
+  the 100-drone swarm's traffic graph), walk settings (walks per drone, length, seed), skip-gram
+  settings (dim, window, negatives, epochs, learning rate, seed), and the training buttons:
+  *Next step* / *Next pair* (Space), *Whole pair*, *Finish walk*, *Finish epoch*, *Train to the
+  end*, *Play* (P) with a pairs-per-second speed.
+- **9-step mode** (on by default): Space goes through one pair in 9 steps (pick u, pick v, draw
+  the negatives, dot products, σ, errors g, loss, gradients, SGD step); the canvases light up
+  as each step is reached, and the **Math** tab on the right shows each step's formula with the
+  pair's real numbers (every negative draw, every dot product written out, the vectors before
+  and after the step).
+- **Graph (middle left):** the current walk (bright inside the window), u in gold, v in green,
+  the negatives in red. Click a drone, then another, to add or remove the link; drag to move.
+- **Embedding (middle right):** at dim 2 the real vectors, z as discs and c as rings, with lines
+  from the origin to z_u and c_v. Above dim 2, with *context vectors c* ticked: Z and C together
+  on the two directions that keep the most of their length, origin unmoved (uncentred PCA); the
+  view says how much the plane keeps (about 70 % on two groups at dim 16, 54 % on the swarm) and
+  the pair's real z_u · c_v next to the on-screen one. Unticked: Z alone, PCA around its mean.
+  Arrows show the SGD step, magnified.
+- **Bottom:** the pair just trained: the walk with the window, then one row per dot product
+  (x = z_u·c, σ(x), target, g = σ − target, loss term) and the step sizes; the loss curve with
+  the untrained level (1 + negatives)·ln 2 and the epoch boundaries.
+- **Right:** the Math tab; how many drones have a same-group drone as most similar vector (and,
+  on the swarm, the same for roles); tabs for the cosine similarity of Z, the co-occurrence counts of the walks
+  (what skip-gram is fitted to), and the negative-sampling chances (∝ count vs ∝ count^0.75).
+  Drones sorted by group, so groups show up as blocks.
+
+### Node2Vec playground
+
+See how p and q bend Node2Vec's random walks. The walks follow `biased_walks`' rule step for
+step (same neighbour order, one random number per step): with p = q = 1 they are exactly
+`random_walks`' walks (a test checks it on every preset).
+
+- **Left:** graph presets (two groups + bridge, barbell, three wheels labelled by group or by
+  role, ring, grid, the 100-drone swarm's traffic labelled by squad or by role, empty) and
+  tools to build your own: 🔗 Link (click two drones: add / remove the link), ➕ Add (click
+  empty space), 🖌 Label (paint with the brush label), ✖ Delete; drag moves a drone in any
+  tool, right-click starts the walk there. p and q sliders (log scale, 0.1 to 10) with shortcuts,
+  and a 3-drone sketch of the rule with the current percentages. *Build one walk*: with
+  **Explain each step in 10 small steps** on (default), Space goes through one walk step in 10:
+  where the walk is (t, v), v's neighbours, where each lies from t (d = 0, 1, 2), the bias α,
+  π = weight × α, the total Z, the chances π / Z, the random number u, where u falls, the move.
+  Off: Space takes a whole step. *Whole step*, *Walk to the end*, *New walk*, *Play*. Before the
+  draw, moving p or q updates the step under way.
+  *Many walks* settings (walks per drone, length, window, seed) and *Embedding* settings.
+- **Centre:** the graph, drones in their label colour. The walk so far (numbered steps), the
+  current drone (gold) and t, the one before it (violet). With the options shown, an arrow to
+  every neighbour as wide as its chance: red = back to t (× 1/p), amber = also next to t (× 1),
+  blue = away from t (× 1/q). Optional halos: where walks from the start drone go.
+- **Right, Math:** every small step reached so far, as a formula with this walk's numbers
+  (the current one framed in gold, scrolled into view): d(t, x) for each neighbour, α, each π,
+  Z written out, each chance next to DeepWalk's, u, the subtractions until u goes below 0, and
+  the move. **This step:** the options table (link weight, where it lies, bias, weight × bias, the
+  Node2Vec chance and DeepWalk's), the chances as one bar, and for the step just taken where the
+  random number fell. **Many walks:** Node2Vec against DeepWalk on the same seed: share of steps
+  back / near / away, steps that change label, training pairs (window) with the same label,
+  different drones per walk, hops from the start; the hops-after-k-steps curve; a q sweep (1/8
+  to 8) of the same-label share and the distance. **Embedding:** skip-gram on those walks
+  (Node2Vec and DeepWalk), how many drones have a same-label most similar vector, and both
+  pictures (PCA above dim 2).
+- **Bottom:** the walk being built and 4 walks from the start drone for each method, as chips
+  in label colours; the arrow before each chip is the kind of step (↩ = back).
 
 ### Jamming playground
 

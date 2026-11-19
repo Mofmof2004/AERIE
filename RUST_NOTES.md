@@ -186,6 +186,80 @@ let mut queue: VecDeque<usize> = (0..n).filter(|&i| labels[i].is_some()).collect
   (maybe fewer out). `collect` can build a `Vec`, a `VecDeque`, a `HashSet`… whatever the
   annotation says.
 
+### How do I draw a random number? (rand 0.10)
+
+```rust
+use rand::{RngExt, SeedableRng};   // RngExt: random_range; SeedableRng: seed_from_u64
+use rand_chacha::ChaCha8Rng;
+
+let mut rng = ChaCha8Rng::seed_from_u64(42);   // same seed, same numbers every run
+let k: usize = rng.random_range(0..10);        // integer, 10 excluded
+let u: f64 = rng.random_range(0.0..2.5);       // float in [0.0, 2.5)
+```
+
+Pass it to functions as `&mut ChaCha8Rng`: drawing a number changes its state.
+
+A whole table of random numbers (n rows of `dim`, each in ±half):
+
+```rust
+let half = 0.5 / dim as f64;
+let z: Vec<Vec<f64>> = (0..n)
+    .map(|_| (0..dim).map(|_| rng.random_range(-half..half)).collect())
+    .collect();
+```
+
+`|_|` is a closure that ignores its input: the index isn't needed, only "do this n times".
+
+### What does `.0` do?
+
+Takes the first element of a tuple (`.1` the second, …). Also reads the value inside a
+one-field wrapper like `DroneId(7)`.
+
+```rust
+let pair: (usize, f64) = (12, 3.5);
+pair.0;                         // 12
+pair.1;                         // 3.5
+for &(j, w) in options { }      // same thing with a pattern: j = .0, w = .1
+DroneId(7).0;                   // 7
+```
+
+### What does `a.iter().zip(&b)` do?
+
+Walks two lists **side by side**, one pair per round: `(a[0], b[0])`, `(a[1], b[1])`, …
+It stops at the end of the shorter list.
+
+```rust
+let neg = vec![7, 2, 9];                     // ids of the negatives
+let grad_neg = vec![g7, g2, g9];             // their gradients, same order
+for (k, g) in neg.iter().zip(&grad_neg) {
+    // round 1: k = &7, g = &g7   round 2: k = &2, g = &g2 ...
+    c[*k][0] -= lr * g[0];                    // *k: the usize behind the reference
+}
+// same as:
+for j in 0..neg.len() {
+    let (k, g) = (neg[j], &grad_neg[j]);
+}
+```
+
+Both items come out as references (`&usize`, `&Vec<f64>`): `*k` gives the number.
+
+### How do I write eˣ, logs, powers? (f64 methods)
+
+Maths functions are **methods on the number**, not free functions like `exp(x)`.
+
+```rust
+let x: f64 = 2.0;
+x.exp();        // eˣ
+(-x).exp();     // e⁻ˣ: parentheses needed, -x.exp() would be -(eˣ)
+x.ln();         // natural log
+x.powf(0.75);   // x^0.75 (float power)
+x.powi(2);      // x² (integer power, faster)
+x.sqrt();  x.abs();
+std::f64::consts::E;  // the number e itself
+```
+
+`2.exp()` doesn't compile: write `2.0_f64.exp()` so Rust knows it's an `f64`.
+
 ## Mistakes the compiler caught
 
 | Mistake | Fix | Why |
@@ -200,3 +274,19 @@ let mut queue: VecDeque<usize> = (0..n).filter(|&i| labels[i].is_some()).collect
 | `no method named solve` | `use faer::linalg::solvers::Solve;` | A trait's methods only exist where the trait is imported. |
 | `let mut` on a variable never changed | drop the `mut` | Warning only, but it tells the reader the value is fixed. |
 | Flag set to `true` once, never reset | `let mut flag = false;` **inside** the loop | Otherwise it stays `true` from an earlier round. |
+| `1.0 / (1.0 + e);` as the last line of a function | drop the `;` | The last expression **without** `;` is the return value. With `;` the function returns `()`: "expected f64, found ()". |
+| Loop fills `result`, function ends with `}` | end with `result` on its own line | Nothing is returned unless you write it. |
+| `let result = 0.0; result += …` | `let mut result = 0.0;` | Variables are read-only unless declared `mut`. |
+| `Vec.new()` | `Vec::new()` | `::` calls a function that belongs to a type; `.` calls a method on a value. |
+| `dot(z_u[i], c_v[j])` | `dot(z_u, c_v)` | `z_u[i]` is one `f64`; `dot` wants the whole slice `&[f64]`. |
+| New file `deepwalk.rs`, no errors at all | add `pub mod deepwalk;` to `mod.rs` | A file nobody declares with `mod` is never compiled, so it can't fail. No errors ≠ correct. |
+| `z = train_skipgram(…);` (first time `z` appears) | `let z = …;` | A new variable always starts with `let`. `x = …` without `let` only works on an existing `let mut x`. |
+| `for edge in graph.edges` with `graph: &EdgeList` | `for edge in &graph.edges` | Without `&` the loop takes the Vec (moves it out), and you can't take what you only borrowed. |
+| `let w: [Vec<usize>] = [k, Vec::new()];` | `let w: Vec<Vec<usize>> = vec![Vec::new(); k];` | `[T]` alone is a slice with unknown size, not a variable type. `vec![value; count]` repeats a value. |
+| `SkipGramConfig.default()` | `SkipGramConfig::default()` | Same as `Vec::new()`: a function on the type, so `::`. |
+| `1/p` with `p: f64` | `1.0 / p` | Same as `1 / d`: `1` is an integer, and Rust won't divide an integer by a float. |
+| `for i in 0..options` (`options` is a slice) | `for &(x, w) in options` | A range needs two numbers; to visit a list, loop over the list itself. `0..options.len()` works too but gives indices, not items. |
+| `rng.random_range(0..list)` to pick an item | `list[rng.random_range(0..list.len())]` | `random_range` gives a number; you index the list with it. |
+| One `}` too many after a function | delete it | "unexpected closing delimiter": count your braces, or let `cargo fmt` show where the indentation breaks. |
+| `next = …;` with no `let next` before | `let mut next = …;` before the branches | Every variable is declared once with `let`; branches can then assign to it. |
+| `let biased_walks = …;` then `train_skipgram(&walks, …)` | `let walks = biased_walks(…);` | The name after `let` is the one you use later. Naming a variable like a function also hides the function for the rest of the block. |
