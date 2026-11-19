@@ -13,7 +13,7 @@ pub struct Gui {
 }
 
 /// Every GUI, in menu order.
-pub const GUIS: [Gui; 6] = [
+pub const GUIS: [Gui; 9] = [
     Gui {
         bin: "swarm_viewer",
         title: "Swarm viewer",
@@ -43,6 +43,21 @@ pub const GUIS: [Gui; 6] = [
         bin: "m1_results",
         title: "Mission 1 results",
         about: "Accuracy against report share for every method and graph; runs the m1 runner.",
+    },
+    Gui {
+        bin: "m2_results",
+        title: "Mission 2 results",
+        about: "Role F1, link AUC and squad NMI for DeepWalk and baselines; runs the m2 runner.",
+    },
+    Gui {
+        bin: "skipgram_playground",
+        title: "Skip-gram playground",
+        about: "Watch DeepWalk learn pair by pair: walks, z and c vectors, loss (Mission 2).",
+    },
+    Gui {
+        bin: "node2vec_playground",
+        title: "Node2Vec playground",
+        about: "Bend the walks with p and q, step by step; build graphs, paint labels (Mission 2).",
     },
 ];
 

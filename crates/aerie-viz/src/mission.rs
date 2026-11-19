@@ -61,7 +61,10 @@ impl Mission {
                  comm graph (epsilon graph, decision D00)."
             }
             Mission::M1 => "Which drones report, and the labels propagated to the silent ones.",
-            Mission::M2 => "Embeddings learned from the traffic log, coloured by role or squad.",
+            Mission::M2 => {
+                "DeepWalk on one flight's traffic log: k-means clusters against squads, \
+                 roles guessed from the vectors, hidden links, and the experiment."
+            }
             Mission::M3 => "The jamming map: true field, noisy readings and the reconstruction.",
             Mission::M4 => {
                 "Gossip rounds spreading the filter output K hops, with the emission counter."
@@ -80,6 +83,6 @@ impl Mission {
 
     /// Whether this mission has a view yet.
     pub fn available(self) -> bool {
-        matches!(self, Mission::M0 | Mission::M1)
+        matches!(self, Mission::M0 | Mission::M1 | Mission::M2)
     }
 }

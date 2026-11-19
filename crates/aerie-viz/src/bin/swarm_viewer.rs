@@ -25,6 +25,7 @@ use swarmsim::tasks::{
 
 use aerie_viz::launch::{GUIS, launch};
 use aerie_viz::m1_view::M1View;
+use aerie_viz::m2_view::M2View;
 use aerie_viz::map::{
     self, ColorBy, JAMMED_DRONE_COLOR, JOINT_COLOR, Layers, LinkColor, LinkSource, MapView,
     RELAY_FAIL_COLOR, RangeCircles, Snapshot, WINNER_COLOR, jam_field, n_near_tasks, task_color,
@@ -73,6 +74,8 @@ struct Viewer {
     launch_msg: Option<String>,
     /// The Mission 1 view: propagated labels on the map, and the experiment.
     m1: M1View,
+    /// The Mission 2 view: DeepWalk on the traffic log, its scores, and the experiment.
+    m2: M2View,
 }
 
 impl Default for Viewer {
@@ -96,6 +99,7 @@ impl Default for Viewer {
             show_settings: false,
             launch_msg: None,
             m1: M1View::default(),
+            m2: M2View::default(),
         };
         viewer.regenerate();
         viewer
@@ -114,6 +118,14 @@ impl eframe::App for Viewer {
             });
 
         self.settings_window(ui.ctx());
+        // Mission 2 is defined on 300 drones: switch once, on the first visit, if the
+        // config is still the default one.
+        if self.mission == Mission::M2 && !self.m2.moved_to_plan {
+            self.m2.moved_to_plan = true;
+            if self.config == SimConfig::default() {
+                self.config = aerie_classic::m2::plan_config();
+            }
+        }
         self.regenerate();
         if self.mission == Mission::M1 {
             self.m1.update(
@@ -127,6 +139,14 @@ impl eframe::App for Viewer {
                 .resizable(true)
                 .default_size(330.0)
                 .show(ui, |ui| self.m1.bottom(ui, &self.config));
+        }
+        if self.mission == Mission::M2 {
+            self.m2
+                .update(ui.ctx(), self.seed, &self.config, self.snapshot.is_some());
+            egui::Panel::bottom("m2_experiment")
+                .resizable(true)
+                .default_size(300.0)
+                .show(ui, |ui| self.m2.bottom(ui, &self.config));
         }
 
         egui::Panel::right("details")
@@ -223,6 +243,10 @@ impl Viewer {
         ui.separator();
         if self.mission == Mission::M1 {
             self.m1.controls(ui, &mut self.seed);
+            ui.separator();
+        }
+        if self.mission == Mission::M2 {
+            self.m2.controls(ui, &mut self.config);
             ui.separator();
         }
 
@@ -444,10 +468,10 @@ impl Viewer {
             self.snapshot.as_ref(),
             &mut self.selected,
             &mut self.selected_task,
-            if self.mission == Mission::M1 {
-                self.m1.overlay()
-            } else {
-                None
+            match self.mission {
+                Mission::M1 => self.m1.overlay(),
+                Mission::M2 => self.m2.overlay(),
+                _ => None,
             }
             .as_ref(),
         );
@@ -756,6 +780,9 @@ impl Viewer {
     fn details(&mut self, ui: &mut egui::Ui) {
         if self.mission == Mission::M1 {
             self.m1.details(ui, &mut self.selected);
+        }
+        if self.mission == Mission::M2 {
+            self.m2.details(ui, &mut self.selected);
         }
         let cfg = &self.config;
 

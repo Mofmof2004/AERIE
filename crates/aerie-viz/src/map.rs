@@ -220,7 +220,7 @@ pub const JAMMED_DRONE_COLOR: Color32 = Color32::from_rgb(200, 255, 0);
 pub struct LabelOverlay<'a> {
     /// Fill of each drone: its class colours mixed by its row of Y (grey: no guess).
     pub fill: &'a [Color32],
-    /// Drones whose label reached the method (gold ring, "R").
+    /// Drones whose label reached the method (gold ring, "R"). Empty slice: no reporters.
     pub reports: &'a [bool],
     /// Reporters that said a wrong class (red ring instead of gold).
     pub lies: &'a [bool],
@@ -234,6 +234,9 @@ pub struct LabelOverlay<'a> {
     pub links: &'a EdgeList,
     /// Extra lines for the drone tooltip.
     pub hover: &'a [String],
+    /// Extra links drawn dashed on top, each in its own colour (Mission 2: the hidden
+    /// links of the link test). Empty: none.
+    pub marked_links: &'a [(usize, usize, Color32)],
 }
 
 /// Map layers the user can switch on and off.
@@ -552,6 +555,32 @@ pub fn draw(
         }
     }
 
+    // Marked links (overlay only), dashed so they stand out from the graph's own links.
+    if let Some(o) = overlay {
+        for &(s, d, color) in o.marked_links {
+            let (Some(a), Some(b)) = (swarm.get(s), swarm.get(d)) else {
+                continue;
+            };
+            let faded = selected.is_some_and(|i| i != s && i != d);
+            painter.extend(Shape::dashed_line(
+                &[
+                    t.to_screen(a.position.x, a.position.y),
+                    t.to_screen(b.position.x, b.position.y),
+                ],
+                Stroke::new(
+                    2.5,
+                    if faded {
+                        color.gamma_multiply(0.2)
+                    } else {
+                        color
+                    },
+                ),
+                6.0,
+                3.0,
+            ));
+        }
+    }
+
     // Drones. Size grows a little with zoom so they stay readable.
     let radius = (5.0 * view.zoom.sqrt()).clamp(4.0, 12.0);
     let outline = Stroke::new(1.0, Color32::from_black_alpha(160));
@@ -612,7 +641,7 @@ pub fn draw(
             painter.circle_stroke(c, radius + 2.5, Stroke::new(1.5, JAMMED_DRONE_COLOR));
         }
         if let Some(o) = overlay {
-            if o.reports[i] {
+            if o.reports.get(i) == Some(&true) {
                 // Reporting drone: a double ring (dark edge so it shows on any fill) and a
                 // bold "R" above the drone; gold for a true report, red for a wrong one.
                 let mark = if o.lies.get(i) == Some(&true) {

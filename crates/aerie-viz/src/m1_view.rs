@@ -323,6 +323,7 @@ impl M1View {
             truth: self.truth_ring.then_some(self.truth_colors.as_slice()),
             links: &c.links,
             hover: &self.hover,
+            marked_links: &[],
         })
     }
 
