@@ -42,6 +42,9 @@ pub struct PlotState {
     pub table_share: usize,
     /// Index into `WRONG_SHARES`: which share of wrong reports the plot and table show.
     pub wrong: usize,
+    /// x-axis = share of wrong reports (at the table's report share) instead of the
+    /// report share.
+    pub x_wrong: bool,
 }
 
 impl Default for PlotState {
@@ -53,6 +56,7 @@ impl Default for PlotState {
             band: true,
             table_share: 3,
             wrong: 0,
+            x_wrong: true,
         }
     }
 }
@@ -148,7 +152,7 @@ impl Runner {
                 .button("▶ Run the experiment")
                 .on_hover_text(
                     "Every method × graph × label × share on test seeds 90–99 × 20 draws, \
-                     with the current settings and α. About 45 s. Writes results/m1/.",
+                     with the current settings and α. About 1 minute. Writes results/m1/.",
                 )
                 .clicked()
             {
@@ -219,12 +223,31 @@ pub fn plot_controls(ui: &mut egui::Ui, st: &mut PlotState) {
         ui.checkbox(&mut st.band, "±1 sd");
     });
     ui.horizontal(|ui| {
-        ui.label("Wrong reports");
-        for (k, w) in WRONG_SHARES.iter().enumerate() {
-            ui.selectable_value(&mut st.wrong, k, format!("{:.0} %", w * 100.0))
-                .on_hover_text("Share of the reporters that say a wrong class.");
+        ui.label("x-axis");
+        ui.selectable_value(&mut st.x_wrong, true, "wrong reports")
+            .on_hover_text("How accuracy falls as more reporters say a wrong class.");
+        ui.selectable_value(&mut st.x_wrong, false, "report share")
+            .on_hover_text("How accuracy grows as more drones report.");
+        ui.separator();
+        if st.x_wrong {
+            ui.label("at");
+            for (k, s) in SHARES.iter().enumerate() {
+                ui.selectable_value(&mut st.table_share, k, format!("{:.0} %", s * 100.0));
+            }
+            ui.label("report");
+        } else {
+            ui.label("wrong reports");
+            for (k, w) in WRONG_SHARES.iter().enumerate() {
+                ui.selectable_value(&mut st.wrong, k, format!("{:.0} %", w * 100.0))
+                    .on_hover_text("Share of the reporters that say a wrong class.");
+            }
         }
     });
+}
+
+/// The x value of a row on the plot.
+fn x_of(st: &PlotState, r: &SummaryRow) -> f64 {
+    if st.x_wrong { r.wrong } else { r.share }
 }
 
 /// The rows of one line, sorted by share.
@@ -234,20 +257,25 @@ fn series<'a>(
     graph: GraphKind,
     method: &str,
 ) -> Vec<&'a SummaryRow> {
+    let fixed = |r: &SummaryRow| {
+        if st.x_wrong {
+            (r.share - SHARES[st.table_share.min(SHARES.len() - 1)]).abs() < 1e-9
+        } else {
+            (r.wrong - WRONG_SHARES[st.wrong.min(WRONG_SHARES.len() - 1)]).abs() < 1e-9
+        }
+    };
     let mut v: Vec<&SummaryRow> = rows
         .iter()
         .filter(|r| {
-            r.label == st.label
-                && r.graph == graph
-                && r.method.name() == method
-                && (r.wrong - WRONG_SHARES[st.wrong]).abs() < 1e-9
+            r.label == st.label && r.graph == graph && r.method.name() == method && fixed(r)
         })
         .collect();
-    v.sort_by(|a, b| a.share.total_cmp(&b.share));
+    v.sort_by(|a, b| x_of(st, a).total_cmp(&x_of(st, b)));
     v
 }
 
-/// Accuracy against the report share (log scale), filling the available space.
+/// Accuracy against the report share (log scale) or the share of wrong reports
+/// (linear), filling the available space.
 pub fn plot(ui: &mut egui::Ui, rows: &[SummaryRow], st: &PlotState) {
     let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::hover());
     let visuals = ui.visuals().clone();
@@ -269,9 +297,20 @@ pub fn plot(ui: &mut egui::Ui, rows: &[SummaryRow], st: &PlotState) {
     if area.width() < 40.0 || area.height() < 40.0 {
         return;
     }
-    let (lo, hi) = (SHARES[0].log10(), SHARES[SHARES.len() - 1].log10());
-    let to_screen = |share: f64, acc: f64| {
-        let t = ((share.log10() - lo) / (hi - lo)) as f32;
+    let ticks: Vec<f64> = if st.x_wrong {
+        WRONG_SHARES.to_vec()
+    } else {
+        SHARES.to_vec()
+    };
+    let x_wrong = st.x_wrong;
+    let (lo, hi) = if x_wrong {
+        (0.0, WRONG_SHARES[WRONG_SHARES.len() - 1])
+    } else {
+        (SHARES[0].log10(), SHARES[SHARES.len() - 1].log10())
+    };
+    let to_screen = |x: f64, acc: f64| {
+        let v = if x_wrong { x } else { x.log10() };
+        let t = ((v - lo) / (hi - lo)) as f32;
         pos2(
             area.left() + t * area.width(),
             area.bottom() - acc.clamp(0.0, 1.0) as f32 * area.height(),
@@ -280,7 +319,7 @@ pub fn plot(ui: &mut egui::Ui, rows: &[SummaryRow], st: &PlotState) {
 
     for k in 0..=4 {
         let acc = k as f64 / 4.0;
-        let y = to_screen(SHARES[0], acc).y;
+        let y = to_screen(ticks[0].max(1e-9), acc).y;
         painter.hline(
             area.x_range(),
             y,
@@ -294,7 +333,7 @@ pub fn plot(ui: &mut egui::Ui, rows: &[SummaryRow], st: &PlotState) {
             weak,
         );
     }
-    for s in SHARES {
+    for &s in &ticks {
         let x = to_screen(s, 0.0).x;
         painter.vline(
             x,
@@ -312,18 +351,32 @@ pub fn plot(ui: &mut egui::Ui, rows: &[SummaryRow], st: &PlotState) {
     painter.text(
         pos2(area.center().x, full.bottom() - 4.0),
         Align2::CENTER_BOTTOM,
-        "share of drones that report (log scale)",
+        if x_wrong {
+            "share of the reporters that say a wrong class"
+        } else {
+            "share of drones that report (log scale)"
+        },
         FontId::proportional(11.0),
         weak,
     );
     painter.text(
         pos2(area.left(), full.top() + 6.0),
         Align2::LEFT_TOP,
-        format!(
-            "label = {}, {:.0} % wrong reports: accuracy on the silent drones (no guess counts as wrong)",
-            st.label.name(),
-            WRONG_SHARES[st.wrong] * 100.0
-        ),
+        if x_wrong {
+            format!(
+                "label = {}, {:.0} % of drones report: accuracy on the silent drones as reports \
+                 turn wrong",
+                st.label.name(),
+                SHARES[st.table_share.min(SHARES.len() - 1)] * 100.0
+            )
+        } else {
+            format!(
+                "label = {}, {:.0} % wrong reports: accuracy on the silent drones (no guess \
+                 counts as wrong)",
+                st.label.name(),
+                WRONG_SHARES[st.wrong.min(WRONG_SHARES.len() - 1)] * 100.0
+            )
+        },
         FontId::proportional(13.0),
         text,
     );
@@ -344,11 +397,17 @@ pub fn plot(ui: &mut egui::Ui, rows: &[SummaryRow], st: &PlotState) {
             }
             let color = METHOD_COLORS[m];
             if st.band {
-                band(&painter, &line, &to_screen, color.gamma_multiply(0.12));
+                band(
+                    &painter,
+                    &line,
+                    &|r| x_of(st, r),
+                    &to_screen,
+                    color.gamma_multiply(0.12),
+                );
             }
             let pts: Vec<Pos2> = line
                 .iter()
-                .map(|r| to_screen(r.share, r.accuracy))
+                .map(|r| to_screen(x_of(st, r), r.accuracy))
                 .collect();
             polyline(&painter, &pts, Stroke::new(2.0, color), graph_dash(g));
             for (p, r) in pts.iter().zip(&line) {
@@ -364,13 +423,18 @@ pub fn plot(ui: &mut egui::Ui, rows: &[SummaryRow], st: &PlotState) {
     }
 
     if let Some((_, r)) = nearest {
-        painter.circle_stroke(to_screen(r.share, r.accuracy), 6.0, Stroke::new(2.0, text));
+        painter.circle_stroke(
+            to_screen(x_of(st, &r), r.accuracy),
+            6.0,
+            Stroke::new(2.0, text),
+        );
         response.on_hover_ui_at_pointer(|ui| {
             ui.strong(format!(
-                "{} on {}, {:.0} % report",
+                "{} on {}, {:.0} % report, {:.0} % of them wrong",
                 r.method.name(),
                 r.graph.name(),
-                r.share * 100.0
+                r.share * 100.0,
+                r.wrong * 100.0
             ));
             ui.label(format!(
                 "accuracy {:.1} % ± {:.1}",
@@ -465,13 +529,14 @@ pub fn table(ui: &mut egui::Ui, rows: &[SummaryRow], st: &mut PlotState) {
 fn band(
     painter: &egui::Painter,
     series: &[&SummaryRow],
+    x: &dyn Fn(&SummaryRow) -> f64,
     to_screen: &impl Fn(f64, f64) -> Pos2,
     color: Color32,
 ) {
     let mut mesh = Mesh::default();
     for r in series {
-        mesh.colored_vertex(to_screen(r.share, r.accuracy + r.accuracy_sd), color);
-        mesh.colored_vertex(to_screen(r.share, r.accuracy - r.accuracy_sd), color);
+        mesh.colored_vertex(to_screen(x(r), r.accuracy + r.accuracy_sd), color);
+        mesh.colored_vertex(to_screen(x(r), r.accuracy - r.accuracy_sd), color);
     }
     for k in 0..series.len().saturating_sub(1) as u32 {
         let (a, b, c, d) = (2 * k, 2 * k + 1, 2 * k + 2, 2 * k + 3);

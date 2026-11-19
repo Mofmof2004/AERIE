@@ -85,7 +85,8 @@ overshoots the target before the squads are connected to each other.
 **Disconnected seeds.** They are kept in the dataset but **excluded from every experiment
 that needs one component**: M1 label propagation, M3 reconstruction, M4 gossip, M6 spectrum,
 M8 split warning. The check is done in code (`stats(..).n_components == 1`). Every experiment
-uses the same list.
+uses the same list. *Amended by D05 for M1: label propagation handles cut-off drones (no
+guess), so M1 keeps all test seeds and reports the no-guess share.*
 
 | Split | Excluded seeds | Seeds left |
 | --- | --- | --- |
@@ -247,3 +248,165 @@ i→j works when margin ≥ 1;  link i–j is live when both directions work
 written for 5 / 9 km; with D01's 2.5 / 16 km the numbers differ (see the jamming
 playground's "How far each role is heard"). The plan's 3 km compute range is not adopted:
 compute is made the weakest through its scale instead, so D01 stands.
+
+---
+
+## D04. Tasks, the relay rule and the oracle labels (Mission 0, step 3)
+
+```
+Chose:     strict role mapping; relay within 2 hops on the live graph for Observe and Track;
+           c_ij = km + 3 (1 − battery), a FLAT penalty of 1000 when not able; tasks the
+           Hungarian oracle can only staff with a penalised drone stay open (None)
+Rejected:  a 3-hop relay rule; penalty added to the travel cost; forcing every task to get
+           a drone
+Evidence:  cargo test --release -p swarmsim print_ -- --ignored --nocapture  (seeds 0-99)
+Cost:      the relay rule is weak (97 % of drones pass), so it barely separates drones
+Revisit:   M5 (if the GNN gains nothing over an MLP, tighten the rule), M10 (ground truth)
+```
+
+**Tasks** (`spawn_tasks`). 50 per snapshot, 4 kinds. Half are placed within 3 km of a random
+drone, the rest uniformly over the arena (rejection keeps them inside).
+
+**Who can take what** (`TaskKind::can_do`, strict): Observe = recon or RF sensing,
+Track = recon, Relay = relay, Fuse = compute. **Able** = the role fits and, for Observe and
+Track, a relay sits within 2 hops on the live graph (`relay_within_two_hops`, a BFS of
+depth 2). 2 hops matches a 2-layer GNN's receptive field (M5).
+
+**Cost** (`cost_matrix`, tasks on rows). c_ij = distance in km + β (1 − battery_i), β = 3, so
+battery adds 0 to 1.5 km. A drone that is not able costs a flat 1000. **Flat**, not "travel +
+penalty": with travel added, the distance of a drone that cannot do the task decided which
+task stayed open, an artefact.
+
+**Oracle labels.** Single winner = cheapest drone for the task alone (row argmin). Joint
+winner = the Hungarian assignment over all tasks (`kuhn_munkres_min` on integer metres, each
+drone used at most once). A task whose only option is a penalised drone stays open.
+
+**Result over seeds 0–99** (5000 tasks)
+
+| | |
+| --- | --- |
+| Drones passing the relay rule | 97.3 % on average (min 88 %); hops to a relay 0 / 1 / 2 / more: 2000 / 6523 / 1209 / 268 |
+| Tasks with no able drone | 0 |
+| Cheapest able cost | median 2.9 km, p90 6.4 km |
+| Tasks left open by the joint oracle | 24 (Fuse tasks outnumbering the 15 compute drones on 11 seeds) |
+| Single winner shared with another task | 2590 (52 %) |
+| Joint winner ≠ single winner | 1765 (35 % of staffed tasks) |
+| Total cost, joint vs singles | +19 % |
+
+**Reading it.**
+- **The relay rule is weak.** With 16 km relay ranges almost every drone has a relay within
+  2 hops. It is kept at 2 hops (the GNN's reach) rather than tuned now; if Mission 5 shows no
+  gain from the graph, this is the first knob.
+- **The two labels really differ.** Half the single winners are wanted by another task, and
+  the joint oracle changes the winner of a third of the tasks. A drone cannot see that from
+  one task, which is the point of Mission 5's regret measure.
+
+---
+
+## D05. Label propagation: default graph, default method, which labels to trust (Mission 1)
+
+```
+Chose:     propagate on the LIVE graph (the comm graph under jamming); RWR (α = 0.85) as the
+           default propagation, LP's closed form as its check; propagate zone and squad,
+           never role; compare against nearest-reporter by km when positions are known and
+           by hops when they are not; no guess counts as wrong, split seeds kept
+Rejected:  kNN (k = 5) as the default graph; the ε graph as the default; propagating role;
+           dropping the seeds whose graph is split
+Evidence:  cargo run --release -p aerie-classic --example m1   (test seeds 90-99 × 20 draws)
+           GUI: swarm viewer, mission M1 (map, per-draw scores, Run, plots)
+Cost:      on clean reports, propagation loses to "copy the nearest reporter by km"
+Revisit:   M0 step 4 (correlation graph, experiment 1), M4 (features + graph), M6 (spoofed
+           reports), whenever the zone label is scored again (balanced accuracy)
+```
+
+**Setup.** `aerie_classic::m1`: label propagation and RWR (closed forms; tests check they equal
+the iterations), majority class, nearest reporter by km and by hops. Labels zone (2), squad
+(10), role (4). Accuracy on the silent drones; a drone no report can reach gets no guess and
+counts as wrong. The same draws for every method, so comparisons are paired. A share of the
+reporters can say a wrong class (0, 10, 25, 40 %).
+
+**Main table** (live graph, 10 % of drones report, no wrong reports; accuracy %)
+
+| label | majority | nearest km | nearest hops | LP | RWR |
+| --- | --- | --- | --- | --- | --- |
+| zone | 91.0 | 91.4 | 89.9 | 91.4 | 91.5 |
+| squad | 8.1 | **61.0** | 51.6 | 51.2 | 53.0 |
+| role | **46.4** | 29.7 | 32.1 | 31.8 | 31.6 |
+
+**Experiment 1, which graph** (LP accuracy against the report share)
+
+| squad | 1 % | 5 % | 10 % | 20 % | 50 % |
+| --- | --- | --- | --- | --- | --- |
+| live | 9.0 | 31.8 | 51.2 | 75.2 | 93.5 |
+| ε (no jamming) | 9.1 | 33.0 | 53.3 | 78.0 | 95.6 |
+| kNN, k = 5 | 9.1 | 37.8 | 61.6 | 86.3 | 98.4 |
+
+| zone | 1 % | 5 % | 10 % | 20 % | 50 % |
+| --- | --- | --- | --- | --- | --- |
+| live | 78.6 | 89.8 | 91.4 | 93.7 | 96.3 |
+| ε | 79.0 | 89.8 | 92.2 | 94.5 | 96.9 |
+| kNN | 21.1 | 58.4 | 77.7 | 92.2 | 98.2 |
+
+**kNN is rejected as the default.** With k = 5 every drone's neighbours are in its own squad,
+so the graph falls into 2–9 islands on the test seeds. That makes it the best graph for squad
+once enough drones report (no leaks between squads), and the worst at low report shares: at
+1 % reporting, 76 % of the silent drones get no guess. ε is slightly better than live, but it
+is the graph without jamming, which the swarm does not have. **Live is the default.**
+
+**Wrong reports** (live graph, 10 % report; accuracy %, in brackets % of lies overruled)
+
+| zone | 0 % wrong | 10 % | 25 % | 40 % |
+| --- | --- | --- | --- | --- |
+| majority | 91.0 | 91.0 | 90.6 | 89.3 |
+| nearest km | 91.4 | 83.9 | 67.4 | 58.8 |
+| LP | 91.4 | **87.6** (0) | **75.2** (0) | **62.6** (0) |
+| RWR | 91.5 | 87.6 (4) | 74.1 (1) | 62.5 (1) |
+
+| squad | 0 % wrong | 10 % | 25 % | 40 % |
+| --- | --- | --- | --- | --- |
+| nearest km | 61.0 | 55.3 | 43.6 | 37.7 |
+| LP | 51.2 | 46.5 | 37.7 | 32.7 |
+| RWR | 53.0 | 48.3 | 39.2 | 34.3 |
+
+**What it means.**
+1. **The graph adds little when positions are known and reports are clean.** The ε and live
+   graphs are built from distance and squads are clusters in space, so the nearest reporter
+   in km already knows what the graph knows, and it never leaks: LP leaks across the ~25 % of
+   links between squads and along the 16 km relay links.
+2. **Propagation pays off when reports are wrong.** The nearest reporter copies one report,
+   lie included; LP averages many and dilutes it. On zone LP leads nearest-by-km by 3.7 points
+   at 10 % wrong and 7.8 at 25 %. On squad the gap to nearest-by-km shrinks (8 → 4 points)
+   but does not close.
+3. **Propagation pays off when positions are unknown.** A silent, jammed drone may not send
+   its position. Then the fair baseline is nearest-by-hops, and RWR beats it on squad (53.0
+   against 51.6) with no lies at all.
+4. **Liars are not corrected.** LP clamps reports (0 % overruled). RWR does not clamp but
+   overrules at most 4 %: with 10 % of drones reporting, a liar's neighbours are mostly
+   silent, so its own restart term wins. Only a lie surrounded by honest reporters is
+   outvoted (lp_playground, "One wrong report"). Propagation protects the drones *around* a
+   liar, not the liar's own label.
+5. **Role cannot be propagated.** Neighbours have different roles (heterophily); every
+   propagation method assumes they agree, and majority wins by 15 points. Role needs features
+   (M4 on).
+6. **RWR over LP as the default**, by a small margin: equal or better on every label at 10 %,
+   and it does not clamp. α matters: at α = 0.9 its squad accuracy fell from 53.0 to 51.4.
+   The α sweep (experiment 4) is still to do.
+7. **The zone numbers flatter majority.** ~90 % of drones are outside the zone, so "everyone is
+   outside" scores 91 % and finds no jammed drone. Plain accuracy is the plan's metric, but
+   later missions should score zone with balanced accuracy (or the recall on "jammed").
+
+**Split seeds.** D01 said to exclude seeds whose graph is split from M1. Amended: label
+propagation now handles drones no report can reach (identity row in the closed form, zero
+row = no guess), so all 10 test seeds are kept and the no-guess share is reported next to
+the accuracy (1 % of the silent drones on the live graph at 10 % reporting).
+
+**Not done in Mission 1** (deferred, on purpose):
+- Experiment 1 on the **correlation graph**: needs Mission 0 step 4 (time series).
+- Experiment 3, **biased reports** (only drones at the zone edge report): not run as an
+  experiment; the swarm viewer's *Pick by hand* mode lets it be explored on one seed. The
+  plan's second question ("which labels can be trusted when the reports are not a random
+  sample") is therefore still open.
+- Experiment 4, **the silent squad**: seen qualitatively (lp_playground preset: LP and RWR
+  both give the cut-off squad its neighbour's class); the α sweep and round counts are not
+  done.
+- The **exam drill** (LP by hand, RWR convergence, inductive vs transductive, task axes).
