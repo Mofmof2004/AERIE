@@ -1,8 +1,8 @@
 //! The Mission 2 experiment: what a listener learns from one flight's traffic.
 //!
 //! For one seed (`run_seed`): build the swarm and its traffic log, embed the undirected
-//! traffic graph with DeepWalk and with Node2Vec at each (p, q) asked for, and score each
-//! embedding three ways (`embed::score`):
+//! traffic graph with DeepWalk, with Node2Vec at each (p, q) asked for and with matrix
+//! factorisation of A, and score each embedding three ways (`embed::score`):
 //! - **role F1**: 5-fold logistic regression on Z, macro-F1;
 //! - **link AUC**: 10 % of the links hidden *before* a second run on the rest;
 //! - **squad NMI**: k-means (k = number of squads, 10 restarts) on the unit-length vectors.
@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use aerie_graph::EdgeList;
+use faer::Mat;
 use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use swarmsim::config::SimConfig;
@@ -31,6 +32,7 @@ use swarmsim::snapshot::Snapshot;
 use swarmsim::traffic::TrafficConfig;
 
 use crate::embed::deepwalk::{DeepWalkConfig, deepwalk};
+use crate::embed::mf::{MfConfig, matrix_factorization};
 use crate::embed::node2vec::{Node2VecConfig, node2vec};
 use crate::embed::score::{
     LinkSplit, cross_val_predict, hide_links, kmeans, link_auc, macro_f1, nmi, normalized,
@@ -67,6 +69,8 @@ pub enum Method {
         p: f64,
         q: f64,
     },
+    /// Matrix factorisation of A = ln(1 + messages): direct links only, no walks.
+    Mf,
     RandomVectors,
     TrafficCounts,
     Majority,
@@ -85,6 +89,7 @@ impl Method {
         match self {
             Method::DeepWalk => "deepwalk".into(),
             Method::Node2Vec { p, q } => format!("node2vec p={p} q={q}"),
+            Method::Mf => "matrix factorisation".into(),
             Method::RandomVectors => "random vectors".into(),
             Method::TrafficCounts => "traffic counts".into(),
             Method::Majority => "majority class".into(),
@@ -99,15 +104,18 @@ impl Method {
                 q: q.parse().ok()?,
             });
         }
-        [Method::DeepWalk]
+        [Method::DeepWalk, Method::Mf]
             .into_iter()
             .chain(Method::BASELINES)
             .find(|m| m.name() == name)
     }
 
-    /// An embedding (DeepWalk or Node2Vec), as opposed to a baseline.
+    /// An embedding (DeepWalk, Node2Vec or MF), as opposed to a baseline.
     pub fn is_embedding(self) -> bool {
-        matches!(self, Method::DeepWalk | Method::Node2Vec { .. })
+        matches!(
+            self,
+            Method::DeepWalk | Method::Node2Vec { .. } | Method::Mf
+        )
     }
 }
 
@@ -150,7 +158,7 @@ pub struct SeedRun {
     /// True role (index into `Role::ALL`) and squad of each drone.
     pub roles: Vec<usize>,
     pub squads: Vec<usize>,
-    /// DeepWalk first, then Node2Vec for each (p, q) asked for.
+    /// DeepWalk first, then Node2Vec for each (p, q) asked for, then MF.
     pub embeddings: Vec<Embedded>,
     /// Each drone's role as guessed from the traffic counts.
     pub counts_guess: Vec<usize>,
@@ -164,6 +172,18 @@ fn rng(seed: u64, stream: u64) -> ChaCha8Rng {
     let mut r = ChaCha8Rng::seed_from_u64(seed);
     r.set_stream(stream);
     r
+}
+
+/// The adjacency matrix with weights ln(1 + messages): what MF fits. The log keeps one
+/// busy relay link (thousands of messages) from swamping every other pair.
+pub fn log_adjacency(graph: &EdgeList) -> Mat<f64> {
+    let mut a = graph.adjacency_matrix();
+    for j in 0..a.ncols() {
+        for i in 0..a.nrows() {
+            a[(i, j)] = a[(i, j)].ln_1p();
+        }
+    }
+    a
 }
 
 /// Log counts per drone: messages sent, received, number of partners.
@@ -185,7 +205,8 @@ fn traffic_counts(graph: &EdgeList, sent: &[u32], received: &[u32]) -> Vec<Vec<f
 }
 
 /// Runs the whole Mission 2 test on seed `seed`: DeepWalk, Node2Vec at each of `biases`
-/// ((p, q) pairs, with DeepWalk's walk and skip-gram settings), and the baselines. Same
+/// ((p, q) pairs, with DeepWalk's walk and skip-gram settings), MF (DeepWalk's dimension,
+/// `MfConfig`'s other defaults), and the baselines. Same
 /// arguments, same result. Every embedding sees the same hidden links, folds and k-means
 /// starts, so their scores differ only by the vectors.
 ///
@@ -223,6 +244,13 @@ pub fn run_seed(seed: u64, sim: &SimConfig, dw: &DeepWalkConfig, biases: &[(f64,
             };
             node2vec(g, &config, seed)
         }
+        Method::Mf => {
+            let config = MfConfig {
+                dim: dw.skipgram.dim,
+                ..Default::default()
+            };
+            matrix_factorization(&log_adjacency(g), &config, seed)
+        }
         _ => deepwalk(g, dw, seed),
     };
     let mut rows = Vec::new();
@@ -231,7 +259,8 @@ pub fn run_seed(seed: u64, sim: &SimConfig, dw: &DeepWalkConfig, biases: &[(f64,
     // Each embedding: once on the full graph (roles, squads), once without the hidden links.
     let methods = [Method::DeepWalk]
         .into_iter()
-        .chain(biases.iter().map(|&(p, q)| Method::Node2Vec { p, q }));
+        .chain(biases.iter().map(|&(p, q)| Method::Node2Vec { p, q }))
+        .chain([Method::Mf]);
     for method in methods {
         let start = Instant::now();
         let z = embed(method, &graph);
@@ -514,9 +543,13 @@ mod tests {
         let n2v = Method::Node2Vec { p: 1.0, q: 0.5 };
         assert_eq!(
             run.rows.iter().map(|r| r.method).collect::<Vec<_>>(),
-            [vec![Method::DeepWalk, n2v], Method::BASELINES.to_vec()].concat()
+            [
+                vec![Method::DeepWalk, n2v, Method::Mf],
+                Method::BASELINES.to_vec()
+            ]
+            .concat()
         );
-        assert_eq!(run.embeddings.len(), 2);
+        assert_eq!(run.embeddings.len(), 3);
         for v in [&run.roles, &run.squads, &run.counts_guess] {
             assert_eq!(v.len(), n);
         }
@@ -553,11 +586,11 @@ mod tests {
     fn a_sweep_is_the_seeds_in_order_and_reproducible() {
         let (sim, dw) = small();
         let rows = sweep(3..5, &sim, &dw, &[], &Progress::default()).unwrap();
-        assert_eq!(rows.len(), 2 * 4);
-        assert!(rows[..4].iter().all(|r| r.seed == 3));
-        assert!(rows[4..].iter().all(|r| r.seed == 4));
+        assert_eq!(rows.len(), 2 * 5);
+        assert!(rows[..5].iter().all(|r| r.seed == 3));
+        assert!(rows[5..].iter().all(|r| r.seed == 4));
         let again = run_seed(4, &sim, &dw, &[]).rows;
-        for (a, b) in rows[4..].iter().zip(&again) {
+        for (a, b) in rows[5..].iter().zip(&again) {
             assert_eq!(
                 (a.role_f1, a.link_auc, a.squad_nmi),
                 (b.role_f1, b.link_auc, b.squad_nmi)
@@ -603,6 +636,7 @@ mod tests {
         ];
         assert_eq!(parse_rows(&rows_csv(&rows)), rows);
         assert!(rows_csv(&rows).contains("node2vec p=1 q=0.25"));
+        assert_eq!(Method::from_name("matrix factorisation"), Some(Method::Mf));
     }
 
     #[test]

@@ -97,10 +97,19 @@ pub fn method_color(m: Method) -> Color32 {
         Method::Node2Vec { q, .. } if q < 1.0 => Color32::from_rgb(44, 170, 150),
         Method::Node2Vec { q, .. } if q > 1.0 => Color32::from_rgb(176, 122, 200),
         Method::Node2Vec { .. } => Color32::from_rgb(130, 175, 225),
+        Method::Mf => Color32::from_rgb(156, 117, 95),
         Method::RandomVectors => Color32::from_rgb(150, 150, 150),
         Method::TrafficCounts => Color32::from_rgb(242, 142, 43),
         Method::Majority => Color32::from_rgb(100, 100, 110),
     }
+}
+
+/// Which embedding the map and the drone details use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shown {
+    DeepWalk,
+    Node2Vec,
+    Mf,
 }
 
 /// What one embedding was computed from.
@@ -162,9 +171,8 @@ pub struct M2View {
     /// Node2Vec's return and in-out parameters (same walks and skip-gram as `dw`).
     pub p: f64,
     pub q: f64,
-    /// The map, the scores' drone details and the nearest vectors use Node2Vec's Z
-    /// (else DeepWalk's).
-    pub use_node2vec: bool,
+    /// The embedding the map, the drone details and the nearest vectors use.
+    pub shown: Shown,
     pub show: Show,
     pub truth_ring: bool,
     pub mark_wrong: bool,
@@ -187,7 +195,7 @@ pub struct M2View {
     links: EdgeList,
     marked: Vec<(usize, usize, Color32)>,
     /// The settings `fill` etc. were built for.
-    overlay_for: Option<(Key, Show, bool, bool, bool)>,
+    overlay_for: Option<(Key, Show, bool, bool, Shown)>,
 }
 
 impl Default for M2View {
@@ -196,7 +204,7 @@ impl Default for M2View {
             dw: DeepWalkConfig::default(),
             p: 1.0,
             q: 0.5,
-            use_node2vec: false,
+            shown: Shown::DeepWalk,
             show: Show::Clusters,
             truth_ring: true,
             mark_wrong: true,
@@ -280,7 +288,13 @@ impl M2View {
 
     /// Which of the seed's embeddings the map uses: 0 DeepWalk, 1 Node2Vec.
     fn shown_index(&self, run: &SeedRun) -> usize {
-        usize::from(self.use_node2vec).min(run.embeddings.len() - 1)
+        // The seed's embeddings: DeepWalk, Node2Vec (the sliders' p, q), MF.
+        let last = run.embeddings.len() - 1;
+        match self.shown {
+            Shown::DeepWalk => 0,
+            Shown::Node2Vec => 1.min(last),
+            Shown::Mf => last,
+        }
     }
 
     /// The finished embedding, if it is the one for the current seed and settings.
@@ -298,7 +312,7 @@ impl M2View {
             self.show,
             self.mark_wrong,
             self.hidden_links,
-            self.use_node2vec,
+            self.shown,
         );
         if self.overlay_for == Some(wanted) {
             return;
@@ -497,16 +511,17 @@ impl M2View {
         );
         ui.horizontal(|ui| {
             ui.label("Map uses");
-            ui.selectable_value(&mut self.use_node2vec, false, "DeepWalk");
+            ui.selectable_value(&mut self.shown, Shown::DeepWalk, "DeepWalk");
             ui.selectable_value(
-                &mut self.use_node2vec,
-                true,
+                &mut self.shown,
+                Shown::Node2Vec,
                 Method::Node2Vec {
                     p: self.p,
                     q: self.q,
                 }
                 .name(),
             );
+            ui.selectable_value(&mut self.shown, Shown::Mf, "MF");
         });
         if !self.status.is_empty() {
             ui.horizontal(|ui| {

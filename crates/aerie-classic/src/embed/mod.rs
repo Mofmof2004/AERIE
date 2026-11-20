@@ -9,6 +9,7 @@
 //! Coming next: HOPE, matrix factorisation.
 
 pub mod deepwalk;
+pub mod mf;
 pub mod node2vec;
 pub mod score;
 pub mod skipgram;
