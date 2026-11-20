@@ -68,6 +68,75 @@ impl EdgeList {
         a
     }
 
+    /// Incidence matrix B (Mission 3): n × m, one row per node, one column per link.
+    ///
+    /// Column e is the link src–dst of weight w: +√w at row src, −√w at row dst, 0
+    /// elsewhere. So (Bᵀx)_e = √w (x_src − x_dst), the jump of the signal x across link e,
+    /// and B Bᵀ = L. The sign (which end gets +) is a convention: flipping it changes Bᵀx's
+    /// sign, never L or the variation. Trend filtering penalises |Bᵀx| (Mission 3).
+    pub fn incidence_matrix(&self) -> Mat<f64> {
+        let n = self.n as usize;
+        let mut incidence_matrix: Mat<f64> = Mat::zeros(n, self.edges.len());
+        for edge in 0..self.edges.len() {
+            incidence_matrix[(self.edges[edge].src as usize, edge)] =
+                self.edges[edge].weight.powf(0.5);
+            incidence_matrix[(self.edges[edge].dst as usize, edge)] =
+                -self.edges[edge].weight.powf(0.5);
+        }
+        incidence_matrix
+    }
+
+    /// Laplacian L = D − A (Mission 3): the weighted degree on the diagonal, minus the link
+    /// weight off it. Symmetric, every row sums to 0, equal to B Bᵀ.
+    ///
+    /// D is built from `degrees()` (m steps) rather than `degree_matrix()` (n²).
+    pub fn laplacian(&self) -> Mat<f64> {
+        let n = self.n as usize;
+        let mut degree_matrix: Mat<f64> = Mat::zeros(n, n);
+        let degree_vertex = self.degrees();
+        let adjacency_matrix = self.adjacency_matrix();
+
+        for i in 0..degree_vertex.len() {
+            degree_matrix[(i, i)] = degree_vertex[i];
+        }
+
+        degree_matrix - adjacency_matrix
+    }
+
+    /// Variation xᵀ L x = Σ over links w (x_i − x_j)²: how bumpy the signal x is (one value
+    /// per node). 0 when linked nodes all agree; Tikhonov's penalty (Mission 3).
+    ///
+    /// Computed node by node: each node's local variability is the sum of its links'
+    /// squared jumps, w (x_i − x_j)²; every link is seen from both ends, hence the ½.
+    /// Looping over the links once would give the same number in m steps instead of n · m.
+    pub fn variation(&self, x: &[f64]) -> f64 {
+        let mut local_variablity: Vec<f64> = Vec::new();
+
+        for i in 0..self.n {
+            let mut node_gradient: Vec<f64> = Vec::new();
+            let mut node_local_variability: f64 = 0.0;
+
+            for edge in &self.edges {
+                if edge.src == i || edge.dst == i {
+                    node_gradient.push(
+                        (edge.weight).powf(0.5) * (x[edge.src as usize] - x[edge.dst as usize]),
+                    );
+                }
+            }
+
+            for j in node_gradient {
+                node_local_variability += j.powi(2);
+            }
+            local_variablity.push(node_local_variability);
+        }
+
+        let mut result: f64 = 0.0;
+        for i in 0..self.n as usize {
+            result += local_variablity[i]
+        }
+        result * 0.5
+    }
+
     /// Degree matrix D (Mission 1): diagonal, `D[i][i]` = weighted degree of node i (the
     /// sum of row i of A), zeros everywhere else. A degree belongs to one node, so there
     /// is nothing off the diagonal.
@@ -411,5 +480,150 @@ mod tests {
         assert_eq!(g.adjacency_matrix().nrows(), 0);
         assert_eq!(g.degree_matrix().ncols(), 0);
         assert_eq!(g.transition_matrix().nrows(), 0);
+    }
+
+    // ----------------------------------------------------------------------- Mission 3
+
+    /// The worked example: path 0 —(1)— 1 —(4)— 2.
+    fn path_1_4() -> EdgeList {
+        EdgeList {
+            n: 3,
+            edges: vec![
+                Edge {
+                    src: 0,
+                    dst: 1,
+                    weight: 1.0,
+                },
+                Edge {
+                    src: 1,
+                    dst: 2,
+                    weight: 4.0,
+                },
+            ],
+        }
+    }
+
+    fn times_own_transpose(b: &Mat<f64>) -> Mat<f64> {
+        let mut out = Mat::zeros(b.nrows(), b.nrows());
+        for i in 0..b.nrows() {
+            for j in 0..b.nrows() {
+                out[(i, j)] = (0..b.ncols()).map(|e| b[(i, e)] * b[(j, e)]).sum();
+            }
+        }
+        out
+    }
+
+    fn x_l_x(l: &Mat<f64>, x: &[f64]) -> f64 {
+        let n = x.len();
+        (0..n)
+            .map(|i| (0..n).map(|j| x[i] * l[(i, j)] * x[j]).sum::<f64>())
+            .sum()
+    }
+
+    #[test]
+    fn incidence_of_the_worked_example() {
+        // +√w at src, −√w at dst: the second column has ±√4 = ±2.
+        assert_mat(
+            &path_1_4().incidence_matrix(),
+            &[&[1.0, 0.0], &[-1.0, 2.0], &[0.0, -2.0]],
+        );
+    }
+
+    #[test]
+    fn incidence_of_the_triangle_plus_isolated() {
+        // Links in order 0–1, 1–2, 0–2; drone 3 has no link: a row of zeros.
+        assert_mat(
+            &triangle_plus_isolated().incidence_matrix(),
+            &[
+                &[1.0, 0.0, 1.0],
+                &[-1.0, 1.0, 0.0],
+                &[0.0, -1.0, -1.0],
+                &[0.0, 0.0, 0.0],
+            ],
+        );
+    }
+
+    #[test]
+    fn laplacian_of_the_worked_example() {
+        assert_mat(
+            &path_1_4().laplacian(),
+            &[&[1.0, -1.0, 0.0], &[-1.0, 5.0, -4.0], &[0.0, -4.0, 4.0]],
+        );
+    }
+
+    #[test]
+    fn laplacian_is_b_bt_and_d_minus_a_and_its_rows_sum_to_zero() {
+        for g in [path_1_4(), weighted_path(), triangle_plus_isolated()] {
+            let l = g.laplacian();
+            let n = g.n as usize;
+            let d_minus_a = &g.degree_matrix() - &g.adjacency_matrix();
+            let bbt = times_own_transpose(&g.incidence_matrix());
+            for i in 0..n {
+                let row: f64 = (0..n).map(|j| l[(i, j)]).sum();
+                assert!(row.abs() < 1e-12, "row {i} sums to {row}");
+                for j in 0..n {
+                    assert!((l[(i, j)] - d_minus_a[(i, j)]).abs() < 1e-12);
+                    assert!(
+                        (l[(i, j)] - bbt[(i, j)]).abs() < 1e-12,
+                        "B Bᵀ ≠ L at ({i}, {j})"
+                    );
+                    assert_eq!(l[(i, j)], l[(j, i)], "not symmetric");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn variation_of_the_worked_examples() {
+        // 1·(1 − 2)² + 4·(2 − 4)² = 17.
+        assert_eq!(path_1_4().variation(&[1.0, 2.0, 4.0]), 17.0);
+        // Triangle with x = (5, 3, 4): jumps 2, −1, 1 -> 4 + 1 + 1 = 6. Drone 3 has no link.
+        assert_eq!(
+            triangle_plus_isolated().variation(&[5.0, 3.0, 4.0, 100.0]),
+            6.0
+        );
+    }
+
+    #[test]
+    fn variation_is_x_l_x_and_the_squared_jumps() {
+        let x = [0.3, -1.2, 2.5, 0.7];
+        for g in [path_1_4(), weighted_path(), triangle_plus_isolated()] {
+            let x = &x[..g.n as usize];
+            let v = g.variation(x);
+            assert!((v - x_l_x(&g.laplacian(), x)).abs() < 1e-12);
+            let b = g.incidence_matrix();
+            let jumps: f64 = (0..b.ncols())
+                .map(|e| {
+                    (0..b.nrows())
+                        .map(|i| b[(i, e)] * x[i])
+                        .sum::<f64>()
+                        .powi(2)
+                })
+                .sum();
+            assert!((v - jumps).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn a_constant_signal_has_no_variation() {
+        // L times a constant is 0: L has no inverse (Tikhonov needs the readings too).
+        let g = path_1_4();
+        assert_eq!(g.variation(&[3.0, 3.0, 3.0]), 0.0);
+        let l = g.laplacian();
+        for i in 0..3 {
+            let lx: f64 = (0..3).map(|j| l[(i, j)] * 3.0).sum();
+            assert_eq!(lx, 0.0);
+        }
+    }
+
+    #[test]
+    fn empty_graph_has_empty_mission_3_matrices() {
+        let g = EdgeList {
+            n: 0,
+            edges: vec![],
+        };
+        assert_eq!(g.incidence_matrix().nrows(), 0);
+        assert_eq!(g.laplacian().nrows(), 0);
+        assert_eq!(g.variation(&[]), 0.0);
     }
 }

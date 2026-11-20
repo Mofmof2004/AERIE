@@ -42,7 +42,7 @@ AERIE/
 │   │       ├── m2.rs       the Mission 2 experiment: run_seed (DeepWalk, Node2Vec at each (p, q), three scores, baselines), sweep, CSV
 │   │       └── embed/      Mission 2 embeddings: walks.rs (random_walks), skipgram.rs (pair_loss_and_grads, train_skipgram), deepwalk.rs (deepwalk), node2vec.rs (biased_walks, node2vec), mf.rs (matrix_factorization), score.rs (role F1, link AUC, squad NMI)
 │   └── aerie-viz/          GUIs (egui): one binary per GUI in src/bin/; shared map.rs, m1_view.rs (Mission 1 view), m1_plot.rs (results plot), m2_view.rs (Mission 2 view, chart, runner)
-│       └── src/bin/        swarm_viewer.rs, graph_playground.rs, jamming_playground.rs, matrix_playground.rs, lp_playground.rs, m1_results.rs, m2_results.rs, skipgram_playground.rs, node2vec_playground.rs, mf_playground.rs
+│       └── src/bin/        swarm_viewer.rs, graph_playground.rs, jamming_playground.rs, matrix_playground.rs, lp_playground.rs, m1_results.rs, m2_results.rs, skipgram_playground.rs, node2vec_playground.rs, mf_playground.rs, graph_matrices_playground.rs, signal_playground.rs, regularizer_playground.rs
 └── target/                 build output (not committed)
 ```
 
@@ -97,6 +97,9 @@ Always use `--release` for the GUIs: they are much smoother.
 | Skip-gram playground | `cargo run --release -p aerie-viz --bin skipgram_playground` |
 | Node2Vec playground | `cargo run --release -p aerie-viz --bin node2vec_playground` |
 | Matrix factorisation playground | `cargo run --release -p aerie-viz --bin mf_playground` |
+| Graph matrices playground | `cargo run --release -p aerie-viz --bin graph_matrices_playground` |
+| Signal playground | `cargo run --release -p aerie-viz --bin signal_playground` |
+| Regularizer playground | `cargo run --release -p aerie-viz --bin regularizer_playground` |
 
 ### Swarm viewer
 
@@ -409,6 +412,74 @@ same Z.
   Z Zᵀ and E = Z Zᵀ − A as heatmaps, drones sorted by label), **Hidden links** (each hidden
   link's z_u · z_v, the share of never-linked pairs it beats, and the AUC).
 - **Bottom:** the loss per epoch, log scale.
+
+### Graph matrices playground
+
+Build a graph by hand, give every drone a value x (the signal: in Mission 3, the jamming power
+it feels), and see every matrix of the graph at once.
+
+- **Left:** presets (the worked examples: a triangle with x = (5, 3, 4), the weighted path
+  0 —1— 1 —4— 2 with x = (1, 2, 4); a star, a square with a diagonal, two triangles and a
+  bridge, two pieces with no link between them, empty), tools (👆 select a drone to edit its x
+  or a link to edit its weight, ➕ add, 🔗 link, ✖ delete; drag to move), signal presets
+  (constant, left to right, alternating, spike, random), and which matrices to show.
+- **Centre:** links as wide as their weight, labelled with their weight or their jump Bᵀx
+  (coloured by its size); drones filled by x (blue below 0, red above).
+- **Right:** A, D, **B** (drones × links: +√w at the link's first drone, −√w at its second),
+  **L = D − A**, **B Bᵀ** (✔ when it equals L), P = D⁻¹A, the normalised Laplacian, then the
+  signal: x, **Bᵀx** (the jump on each link), **Lx** (each drone against its neighbours) and
+  **xᵀLx** three ways (Σ over links w (x_i − x_j)², |Bᵀx|², x · Lx, ✔ when they agree). Hover a
+  cell for where its number comes from; its drone or link lights up on the graph, and hovering
+  a drone or a link lights up its row or column.
+
+### Signal playground
+
+How bumpy is a signal on a graph, and what does smoothing do to it? The measures come from
+`EdgeList::variation`, `incidence_matrix` and `laplacian`.
+
+- **Left:** the graph (a path of 30, a 12 × 12 grid, or a seed's 100-drone ε-graph from
+  Mission 0), the signal (constant, ramp, bump, sharp edge, pure noise; on the swarm, the true
+  jamming power and the noisy sensor readings), *Add noise* (σ), a 🖌 brush to paint values,
+  smoothing steps x ← x − α L x (α = 1 / (2 · largest degree): each drone moves toward its
+  neighbours' weighted average), and 📌 *Pin* to keep a signal's numbers.
+- **Centre:** drones coloured by x or by their local variation (Σ over their links of
+  w (x_i − x_j)²), links by the size of their jump. **Bottom:** the signal along the path, or
+  against the horizontal position.
+- **Right:** xᵀLx (Tikhonov's penalty), the total variation Σ √w |x_i − x_j| (trend
+  filtering's), xᵀx and xᵀLx / xᵀx; the links that carry the most variation; the pinned
+  signals side by side. On the path, a ramp and a sharp edge have the same total variation
+  (1) but xᵀLx 1/29 against 1: the reason Tikhonov blurs edges and trend filtering keeps them.
+
+### Regularizer playground
+
+Rebuild a signal from noisy sensors with four regularizers side by side (all from
+`aerie_classic::regularize`), each keeping the map close to the readings but measuring "change"
+its own way:
+
+| Regularizer | Penalty | Gives |
+|---|---|---|
+| Tikhonov | γ Σ_links w (x_i − x_j)², one solve | smooth slopes (blurs edges) |
+| Trend filtering (order 1) | λ Σ_drones \|(Lx)_i\|, ADMM | straight pieces joined at a few kinks |
+| Total variation (order 0) | λ Σ_links √w \|x_i − x_j\|, ADMM | flat pieces, sharp edges (stairs on slopes) |
+| Sparse local variation | λ Σ_drones ‖∇_i x‖₂, ADMM | few drones see change, the rest of each area flat |
+
+- **Left:** a scenario made for each regularizer, checked with real numbers (each wins its own
+  with its best parameter): a random smooth field on a path (Tikhonov), slopes with kinks
+  (trend filtering), a disc with a sharp edge on a grid (total variation), the swarm's real
+  jamming field from the RF sensing drones (sparse local variation); or your own settings
+  (graph: tiny path, path of 40, 12 × 12 grid, swarm; truth: random smooth, bump, kinks,
+  steps, disc, hotspots, jamming; sensors; noise). Each regularizer on or off with its
+  parameter, the ADMM rounds, what the maps show. Results: each one's NMSE (the best in bold),
+  *Tune every parameter* by the truth or by 20 % held-out sensors (curves, bests, *Use these
+  parameters*), and the ADMM loops' convergence.
+- **Centre:** one map per regularizer (up to 2 × 2), titled with its parameter and NMSE;
+  click a drone to select it (or toggle its sensor). **Bottom:** every curve along the path, or
+  every map against the truth.
+- **Right, the maths:** the common shape (fit + penalty) and the four penalties with what they
+  favour; Tikhonov written out (L, K, b, x̂ and truth for the selected drone's block, and its
+  row solved by hand, ✔ against the solver); for each ADMM method its three steps and its
+  numbers: drones with a bend (trend filtering), links with a jump (total variation), drones
+  that see change (sparse local variation), and the selected drone's values.
 
 ### Jamming playground
 

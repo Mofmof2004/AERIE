@@ -13,7 +13,7 @@ pub struct Gui {
 }
 
 /// Every GUI, in menu order.
-pub const GUIS: [Gui; 10] = [
+pub const GUIS: [Gui; 13] = [
     Gui {
         bin: "swarm_viewer",
         title: "Swarm viewer",
@@ -63,6 +63,21 @@ pub const GUIS: [Gui; 10] = [
         bin: "mf_playground",
         title: "Matrix factorisation playground",
         about: "Watch Z Zᵀ rebuild A epoch by epoch, with the math; hide links (Mission 2).",
+    },
+    Gui {
+        bin: "graph_matrices_playground",
+        title: "Graph matrices playground",
+        about: "Build a graph, give drones values: A, D, B, L, BBᵀ, P, Bᵀx, Lx, xᵀLx (Mission 3).",
+    },
+    Gui {
+        bin: "signal_playground",
+        title: "Signal playground",
+        about: "How bumpy is a signal: xᵀLx vs total variation, smoothing, the jamming field (Mission 3).",
+    },
+    Gui {
+        bin: "regularizer_playground",
+        title: "Regularizer playground",
+        about: "Tikhonov, trend filtering, total variation, sparse local variation side by side (Mission 3).",
     },
 ];
 

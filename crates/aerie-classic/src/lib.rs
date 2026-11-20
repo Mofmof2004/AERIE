@@ -14,4 +14,5 @@ pub mod eval;
 pub mod lp;
 pub mod m1;
 pub mod m2;
+pub mod regularize;
 pub mod rwr;
