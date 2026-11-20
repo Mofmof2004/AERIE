@@ -5,7 +5,8 @@
 //!   straight pieces joined at kinks.
 //! - `total_variation` (trend filtering of order 0): λ ‖Bᵀx‖₁ instead, by ADMM. Few links
 //!   jump: flat pieces, sharp edges.
-//! - `sparse_local_variation_run`: λ Σ_i ‖∇_i x‖₂ instead, by ADMM: few drones see change.
+//! - `sparse_total_variation_run`: total variation + λ₂ Σ_i |x_i|, by ADMM: flat pieces,
+//!   most of the map exactly 0.
 //! - `Regularizer` + `reconstruct`: any of them through one entry point.
 //!
 //! In all of them, `y[i]` is drone i's reading, used only where `has_sensor[i]` is true (M picks
@@ -154,23 +155,10 @@ pub fn tv_penalty(graph: &EdgeList, x: &[f64]) -> f64 {
     jumps(graph, x).iter().map(|j| j.abs()).sum()
 }
 
-/// Each drone's local variation ‖∇_i x‖₂ = √(Σ over its links w (x_i − x_j)²): how much
-/// the signal changes around it, as one number.
-pub fn local_variation(graph: &EdgeList, x: &[f64]) -> Vec<f64> {
-    let mut sq = vec![0.0; graph.n as usize];
-    for e in &graph.edges {
-        let (a, b) = (e.src as usize, e.dst as usize);
-        let c = e.weight * (x[a] - x[b]).powi(2);
-        sq[a] += c;
-        sq[b] += c;
-    }
-    sq.into_iter().map(f64::sqrt).collect()
-}
-
-/// Sparse local variation Σ_i ‖∇_i x‖₂: the local variations added up, not squared.
-/// Small when few drones see any change around them.
-pub fn slv_penalty(graph: &EdgeList, x: &[f64]) -> f64 {
-    local_variation(graph, x).iter().sum()
+/// Sparse total variation λ₁ ‖Bᵀx‖₁ + λ₂ ‖x‖₁: the jumps and the values themselves, not
+/// squared. Small when the map is flat in pieces and 0 almost everywhere.
+pub fn stv_penalty(graph: &EdgeList, x: &[f64], lambda1: f64, lambda2: f64) -> f64 {
+    lambda1 * tv_penalty(graph, x) + lambda2 * x.iter().map(|v| v.abs()).sum::<f64>()
 }
 
 // ---------------------------------------------------------------------- reconstructions
@@ -329,6 +317,50 @@ pub fn trend_filtering_run(
     Reconstruction { x, gaps }
 }
 
+/// Theory for denoising with Tikhonov (a reading at every drone, noise σ on each):
+/// returns (bias², variance) at this γ, with H = (I + γL)⁻¹.
+///
+/// x̂ = H y = H (x + noise), so on average x̂ = H x: the bias is (H − I) x (the blur), and
+/// bias² = |H x − x|². The noise goes through H too: its total variance is
+/// σ² · trace(H Hᵀ), the sum of the squares of every entry of H. Their sum is the expected
+/// error E|x̂ − x|². γ = 0: no bias, variance n σ²; γ → ∞ (connected graph): bias²
+/// Σ (x_i − mean)², variance σ².
+pub fn bias_variance(graph: &EdgeList, x_true: &[f64], sigma: f64, gamma: f64) -> (f64, f64) {
+    let n = graph.n as usize;
+    let laplacian = graph.laplacian();
+
+    let mut k: Mat<f64> = Mat::zeros(n, n);
+    for row in 0..n {
+        for col in 0..n {
+            k[(row, col)] = gamma * laplacian[(row, col)];
+        }
+        k[(row, row)] += 1.0;
+    }
+
+    let identity: Mat<f64> = Mat::identity(n, n);
+    let h: Mat<f64> = k.partial_piv_lu().solve(&identity);
+
+    let mut bias2 = 0.0;
+    for i in 0..n {
+        let mut hx_i = 0.0;
+        for j in 0..n {
+            hx_i += h[(i, j)] * x_true[j];
+        }
+        bias2 += (hx_i - x_true[i]).powi(2);
+    }
+
+    // ---- Step 4: variance = σ² · (sum of the squares of every entry of H) ----------
+    let mut sum_squares = 0.0;
+    for i in 0..n {
+        for j in 0..n {
+            sum_squares += h[(i, j)] * h[(i, j)];
+        }
+    }
+    let variance = sigma * sigma * sum_squares;
+
+    (bias2, variance)
+}
+
 /// ‖Lx‖₁ = Σ_i |Σ_j w_ij (x_i − x_j)|: how much the slope bends, drone by drone.
 pub fn tf_penalty(graph: &EdgeList, x: &[f64]) -> f64 {
     let l = graph.laplacian();
@@ -338,102 +370,73 @@ pub fn tf_penalty(graph: &EdgeList, x: &[f64]) -> f64 {
         .sum()
 }
 
-/// A link seen from one end: (the drone, its neighbour, √w).
-type HalfLink = (usize, usize, f64);
-
-/// Every link seen from each of its ends: (the drone, its neighbour, √w), grouped by drone.
-/// Drone i's local gradient ∇_i x is the list √w (x_neighbour − x_i) over its half-links.
-fn half_links(graph: &EdgeList) -> (Vec<HalfLink>, Vec<std::ops::Range<usize>>) {
-    let n = graph.n as usize;
-    let mut half: Vec<HalfLink> = Vec::with_capacity(2 * graph.edges.len());
-    for e in &graph.edges {
-        let (a, b, s) = (e.src as usize, e.dst as usize, e.weight.sqrt());
-        half.push((a, b, s));
-        half.push((b, a, s));
-    }
-    half.sort_by_key(|h| h.0);
-    let mut groups = vec![0..0; n];
-    let mut start = 0;
-    for (i, g) in groups.iter_mut().enumerate() {
-        let mut end = start;
-        while end < half.len() && half[end].0 == i {
-            end += 1;
-        }
-        *g = start..end;
-        start = end;
-    }
-    (half, groups)
-}
-
-/// Sparse local variation by ADMM: min ½‖M(x − y)‖² + λ Σ_i ‖∇_i x‖₂.
+/// Sparse total variation by ADMM: min ½‖M(x − y)‖² + λ₁ ‖Bᵀx‖₁ + λ₂ ‖x‖₁.
 ///
-/// Like trend filtering, but the differences are shrunk drone by drone instead of link by
-/// link: a drone's whole local gradient is set to 0 when it is small (block soft
-/// threshold), so most drones end up with a flat neighbourhood.
+/// Total variation with a second term that pulls each value itself toward 0: the map comes
+/// out flat in pieces (the jumps) and exactly 0 almost everywhere (the values), with a few
+/// patches that survive. λ₂ = 0 is total variation.
+///
+/// Two helper variables, one for the jumps (z₁ = Bᵀx, one per link) and one for the values
+/// (z₂ = x, one per drone), each with its own tally (u₁, u₂):
 ///
 /// ```text
-/// x ← solve (MᵀM + 2ρ L) x = MᵀM y + ρ Dᵀ(z − u)     D x lists every ∇_i x (DᵀD = 2L)
-/// z_i ← max(0, 1 − (λ/ρ) / |v_i|) · v_i, v_i = ∇_i x + u_i   drone by drone
-/// u ← u + D x − z
+/// x  ← solve (MᵀM + ρ(L + I)) x = MᵀM y + ρ B (z₁ − u₁) + ρ (z₂ − u₂)
+/// z₁ ← soft_threshold(Bᵀx + u₁, λ₁/ρ)   link by link
+/// z₂ ← soft_threshold(x + u₂, λ₂/ρ)      drone by drone
+/// u₁ ← u₁ + Bᵀx − z₁,   u₂ ← u₂ + x − z₂
 /// ```
-pub fn sparse_local_variation_run(
+///
+/// The I in the x-step's matrix makes it invertible even in a piece with no sensor (the
+/// sparsity term pins such a piece to 0). The gap is |Bᵀx − z₁| and |x − z₂| together.
+pub fn sparse_total_variation_run(
     graph: &EdgeList,
     y: &[f64],
     has_sensor: &[bool],
-    lambda: f64,
+    lambda1: f64,
+    lambda2: f64,
     rho: f64,
     iterations: usize,
 ) -> Reconstruction {
     let n = graph.n as usize;
-    let (half, groups) = half_links(graph);
-    let h = half.len();
-    let solver = mask_plus_laplacian(graph, has_sensor, 2.0 * rho).partial_piv_lu();
+    let m = graph.edges.len();
+    let mut k = mask_plus_laplacian(graph, has_sensor, rho);
+    for i in 0..n {
+        k[(i, i)] += rho;
+    }
+    let solver = k.partial_piv_lu();
     let readings = masked_readings(y, has_sensor);
-    // D x: every drone's local gradient, half-link by half-link.
-    let d = |x: &[f64]| -> Vec<f64> { half.iter().map(|&(a, b, s)| s * (x[b] - x[a])).collect() };
 
     let mut x = vec![0.0; n];
-    let mut z = vec![0.0; h];
-    let mut u = vec![0.0; h];
+    let (mut z1, mut u1) = (vec![0.0; m], vec![0.0; m]);
+    let (mut z2, mut u2) = (vec![0.0; n], vec![0.0; n]);
     let mut gaps = Vec::with_capacity(iterations);
     for _ in 0..iterations {
-        // 1. x: Dᵀ(z − u) puts each half-link's value back on its two drones.
-        let mut pull = vec![0.0; n];
-        for (k, &(a, b, s)) in half.iter().enumerate() {
-            let v = s * (z[k] - u[k]);
-            pull[a] -= v;
-            pull[b] += v;
-        }
-        let rhs: Vec<f64> = readings
-            .iter()
-            .zip(&pull)
-            .map(|(r, p)| r + rho * p)
+        // 1. x: the fit, pulled toward the jumps z₁ and the values z₂ (minus their tallies).
+        let z1_minus_u1: Vec<f64> = z1.iter().zip(&u1).map(|(z, u)| z - u).collect();
+        let pull = spread(graph, &z1_minus_u1);
+        let rhs: Vec<f64> = (0..n)
+            .map(|i| readings[i] + rho * pull[i] + rho * (z2[i] - u2[i]))
             .collect();
         x = solve_with(&solver, &rhs);
 
-        // 2. z: each drone's gradient (plus the tally), shrunk as a whole.
-        let dx = d(&x);
-        for range in &groups {
-            let norm = range
-                .clone()
-                .map(|k| (dx[k] + u[k]).powi(2))
-                .sum::<f64>()
-                .sqrt();
-            let keep = if norm > 0.0 {
-                (1.0 - (lambda / rho) / norm).max(0.0)
-            } else {
-                0.0
-            };
-            for k in range.clone() {
-                z[k] = keep * (dx[k] + u[k]);
-            }
+        // 2. z₁: the jumps, small ones erased; z₂: the values, small ones erased.
+        let bx = jumps(graph, &x);
+        for ((z, &j), &u) in z1.iter_mut().zip(&bx).zip(&u1) {
+            *z = soft_threshold(j + u, lambda1 / rho);
+        }
+        for ((z, &xi), &u) in z2.iter_mut().zip(&x).zip(&u2) {
+            *z = soft_threshold(xi + u, lambda2 / rho);
         }
 
-        // 3. u.
+        // 3. The tallies.
         let mut gap = 0.0;
-        for ((uk, &dk), &zk) in u.iter_mut().zip(&dx).zip(&z) {
-            *uk += dk - zk;
-            gap += (dk - zk).powi(2);
+        for ((u, &j), &z) in u1.iter_mut().zip(&bx).zip(&z1) {
+            *u += j - z;
+            gap += (j - z).powi(2);
+        }
+        for ((u, &xi), &z) in u2.iter_mut().zip(&x).zip(&z2) {
+            *u += xi - z;
+            gap += (xi - z).powi(2);
         }
         gaps.push(gap.sqrt());
     }
@@ -451,8 +454,8 @@ pub enum Regularizer {
     TrendFiltering { lambda: f64 },
     /// ½‖M(x − y)‖² + λ ‖Bᵀx‖₁ (total variation): flat pieces, sharp edges.
     TotalVariation { lambda: f64 },
-    /// ½‖M(x − y)‖² + λ Σ_i ‖∇_i x‖₂: most drones see no change around them.
-    SparseLocalVariation { lambda: f64 },
+    /// ½‖M(x − y)‖² + λ₁ ‖Bᵀx‖₁ + λ₂ ‖x‖₁: flat pieces, most of the map exactly 0.
+    SparseTotalVariation { lambda1: f64, lambda2: f64 },
 }
 
 impl Regularizer {
@@ -461,7 +464,7 @@ impl Regularizer {
             Regularizer::Tikhonov { .. } => "Tikhonov",
             Regularizer::TrendFiltering { .. } => "trend filtering",
             Regularizer::TotalVariation { .. } => "total variation",
-            Regularizer::SparseLocalVariation { .. } => "sparse local variation",
+            Regularizer::SparseTotalVariation { .. } => "sparse total variation",
         }
     }
 
@@ -471,7 +474,7 @@ impl Regularizer {
             self,
             Regularizer::TrendFiltering { .. }
                 | Regularizer::TotalVariation { .. }
-                | Regularizer::SparseLocalVariation { .. }
+                | Regularizer::SparseTotalVariation { .. }
         )
     }
 
@@ -481,7 +484,9 @@ impl Regularizer {
             Regularizer::Tikhonov { gamma } => gamma * graph.variation(x),
             Regularizer::TrendFiltering { lambda } => lambda * tf_penalty(graph, x),
             Regularizer::TotalVariation { lambda } => lambda * tv_penalty(graph, x),
-            Regularizer::SparseLocalVariation { lambda } => lambda * slv_penalty(graph, x),
+            Regularizer::SparseTotalVariation { lambda1, lambda2 } => {
+                stv_penalty(graph, x, lambda1, lambda2)
+            }
         }
     }
 }
@@ -506,8 +511,8 @@ pub fn reconstruct(
         Regularizer::TotalVariation { lambda } => {
             total_variation_run(graph, y, has_sensor, lambda, 1.0, iterations)
         }
-        Regularizer::SparseLocalVariation { lambda } => {
-            sparse_local_variation_run(graph, y, has_sensor, lambda, 1.0, iterations)
+        Regularizer::SparseTotalVariation { lambda1, lambda2 } => {
+            sparse_total_variation_run(graph, y, has_sensor, lambda1, lambda2, 1.0, iterations)
         }
     }
 }
@@ -690,25 +695,21 @@ mod tests {
         let g = triangle();
         let x = [1.0, 2.0, 4.0];
         assert!((tv_penalty(&g, &x) - 8.0).abs() < 1e-12);
-        // Local variations: drone 0 √(1 + 9), drone 1 √(1 + 16), drone 2 √(16 + 9).
-        let lv = local_variation(&g, &x);
-        for (got, want) in lv.iter().zip([10f64.sqrt(), 17f64.sqrt(), 5.0]) {
-            assert!((got - want).abs() < 1e-12);
-        }
-        assert!((slv_penalty(&g, &x) - (10f64.sqrt() + 17f64.sqrt() + 5.0)).abs() < 1e-12);
+        // Sparse TV: 0.5 × 8 + 0.1 × (1 + 2 + 4).
+        assert!((stv_penalty(&g, &x, 0.5, 0.1) - 4.7).abs() < 1e-12);
     }
 
-    /// ½‖M(x − y)‖² + λ Σ_i ‖∇_i x‖₂.
-    fn slv_objective(g: &EdgeList, x: &[f64], y: &[f64], has: &[bool], lambda: f64) -> f64 {
+    /// ½‖M(x − y)‖² + λ₁ ‖Bᵀx‖₁ + λ₂ ‖x‖₁.
+    fn stv_objective(g: &EdgeList, x: &[f64], y: &[f64], has: &[bool], l1: f64, l2: f64) -> f64 {
         let fit: f64 = (0..x.len())
             .filter(|&i| has[i])
             .map(|i| 0.5 * (x[i] - y[i]).powi(2))
             .sum();
-        fit + lambda * slv_penalty(g, x)
+        fit + stv_penalty(g, x, l1, l2)
     }
 
     #[test]
-    fn sparse_local_variation_converges_to_a_minimum() {
+    fn sparse_total_variation_converges_to_a_minimum() {
         let g = path(16);
         let y: Vec<f64> = step(16)
             .iter()
@@ -716,19 +717,19 @@ mod tests {
             .map(|(i, v)| v + 0.08 * ((i * 3 % 5) as f64 - 2.0))
             .collect();
         let has = vec![true; 16];
-        let run = sparse_local_variation_run(&g, &y, &has, 0.2, 1.0, 4000);
+        let run = sparse_total_variation_run(&g, &y, &has, 0.2, 0.05, 1.0, 4000);
         assert!(
             *run.gaps.last().unwrap() < 1e-7,
             "gap {}",
             run.gaps.last().unwrap()
         );
-        let best = slv_objective(&g, &run.x, &y, &has, 0.2);
+        let best = stv_objective(&g, &run.x, &y, &has, 0.2, 0.05);
         for i in 0..16 {
             for d in [-1e-3, 1e-3] {
                 let mut x = run.x.clone();
                 x[i] += d;
                 assert!(
-                    slv_objective(&g, &x, &y, &has, 0.2) >= best - 1e-9,
+                    stv_objective(&g, &x, &y, &has, 0.2, 0.05) >= best - 1e-9,
                     "drone {i}"
                 );
             }
@@ -736,22 +737,36 @@ mod tests {
     }
 
     #[test]
-    fn sparse_local_variation_leaves_most_drones_with_a_flat_neighbourhood() {
-        // Clean step on a path of 30.
-        let g = path(30);
-        let y = step(30);
-        let has = vec![true; 30];
-        let x = sparse_local_variation_run(&g, &y, &has, 0.3, 1.0, 3000).x;
-        // The change stays next to the edge (drones 14 and 15) and dies off within a few
-        // drones: each link is in the neighbourhood of both its drones, so the drones right
-        // beside the edge can't be made perfectly flat, but those 4 or more away are.
-        let lv = local_variation(&g, &x);
-        assert!(lv[14] > 0.5 && lv[15] > 0.5, "the edge survives: {lv:?}");
-        for (i, v) in lv.iter().enumerate() {
-            if !(11..=18).contains(&i) {
-                assert!(*v < 1e-3, "drone {i} still sees {v}");
-            }
+    fn sparse_total_variation_contains_total_variation_and_soft_thresholding() {
+        let g = path(12);
+        let y: Vec<f64> = step(12).iter().map(|v| v + 0.05).collect();
+        let has = vec![true; 12];
+        // λ₂ = 0: total variation.
+        let a = sparse_total_variation_run(&g, &y, &has, 0.2, 0.0, 1.0, 3000).x;
+        let b = total_variation(&g, &y, &has, 0.2, 1.0, 3000);
+        assert!(a.iter().zip(&b).all(|(p, q)| (p - q).abs() < 1e-6));
+        // λ₁ = 0, every drone measured: each value on its own, soft-thresholded by λ₂.
+        let x = sparse_total_variation_run(&g, &y, &has, 0.0, 0.3, 1.0, 3000).x;
+        for (xi, yi) in x.iter().zip(&y) {
+            assert!((xi - soft_threshold(*yi, 0.3)).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn sparse_total_variation_keeps_a_patch_and_zeroes_the_rest() {
+        // Path of 30: 0 everywhere except a patch of 1 on drones 12..18, slightly noisy.
+        let g = path(30);
+        let y: Vec<f64> = (0..30)
+            .map(|i| if (12..18).contains(&i) { 1.0 } else { 0.0 } + 0.05 * ((i * 7 % 5) as f64 - 2.0))
+            .collect();
+        let has = vec![true; 30];
+        let x = sparse_total_variation_run(&g, &y, &has, 0.1, 0.1, 1.0, 4000).x;
+        let zeros = x.iter().filter(|v| v.abs() < 1e-6).count();
+        assert!(zeros >= 20, "{zeros} drones exactly 0: {x:?}");
+        assert!(x[14] > 0.6, "the patch survives: {}", x[14]);
+        // Total variation alone leaves the background at small non-zero levels.
+        let tv = total_variation(&g, &y, &has, 0.1, 1.0, 4000);
+        assert!(tv.iter().filter(|v| v.abs() < 1e-6).count() < zeros);
     }
 
     #[test]
@@ -763,7 +778,10 @@ mod tests {
             Regularizer::Tikhonov { gamma: 1.0 },
             Regularizer::TrendFiltering { lambda: 0.2 },
             Regularizer::TotalVariation { lambda: 0.2 },
-            Regularizer::SparseLocalVariation { lambda: 0.2 },
+            Regularizer::SparseTotalVariation {
+                lambda1: 0.2,
+                lambda2: 0.05,
+            },
         ] {
             let r = reconstruct(&g, &y, &has, reg, 300);
             assert_eq!(r.x.len(), 10, "{}", reg.name());
@@ -790,6 +808,82 @@ mod tests {
             "tf {} vs tv {}",
             err(&tf.x),
             err(&tv)
+        );
+    }
+
+    #[test]
+    fn bias_variance_at_both_ends_of_gamma() {
+        let g = path(8);
+        let x: Vec<f64> = (0..8).map(|i| (i as f64 * 0.7).sin()).collect();
+        let sigma = 0.3;
+        // γ = 0: H = I, no blur, all the noise: n σ².
+        let (b, v) = bias_variance(&g, &x, sigma, 0.0);
+        assert!(b.abs() < 1e-20 && (v - 8.0 * sigma * sigma).abs() < 1e-12);
+        // γ huge: everyone at the mean, noise averaged over all 8: σ².
+        let (b, v) = bias_variance(&g, &x, sigma, 1e9);
+        let mean = x.iter().sum::<f64>() / 8.0;
+        let spread: f64 = x.iter().map(|xi| (xi - mean).powi(2)).sum();
+        assert!((b - spread).abs() < 1e-6 && (v - sigma * sigma).abs() < 1e-6);
+    }
+
+    #[test]
+    fn bias_rises_and_variance_falls_with_gamma() {
+        let g = path(10);
+        let x: Vec<f64> = (0..10).map(|i| (i as f64 * 0.5).sin()).collect();
+        let curve: Vec<(f64, f64)> = [0.01, 0.1, 1.0, 10.0]
+            .iter()
+            .map(|&gamma| bias_variance(&g, &x, 0.4, gamma))
+            .collect();
+        assert!(
+            curve.windows(2).all(|w| w[1].0 > w[0].0),
+            "bias² goes up: {curve:?}"
+        );
+        assert!(
+            curve.windows(2).all(|w| w[1].1 < w[0].1),
+            "variance goes down: {curve:?}"
+        );
+    }
+
+    #[test]
+    fn bias_variance_matches_500_simulated_noise_draws() {
+        // Experiment 1 in miniature: rebuild 500 noisy copies with tikhonov, measure the
+        // blur of their mean and their spread, compare with the formulas.
+        use rand::{RngExt, SeedableRng};
+        use rand_chacha::ChaCha8Rng;
+        let g = path(12);
+        let x: Vec<f64> = (0..12).map(|i| if i < 6 { 1.0 } else { 0.0 }).collect();
+        let (sigma, gamma, draws) = (0.5, 0.8, 500);
+        let all = vec![true; 12];
+        let mut rng = ChaCha8Rng::seed_from_u64(9);
+        let mut gauss = || {
+            let u1: f64 = rng.random_range(1e-12..1.0);
+            let u2: f64 = rng.random_range(0.0..1.0);
+            (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+        };
+        let maps: Vec<Vec<f64>> = (0..draws)
+            .map(|_| {
+                let y: Vec<f64> = x.iter().map(|v| v + sigma * gauss()).collect();
+                tikhonov(&g, &y, &all, gamma)
+            })
+            .collect();
+        let mean: Vec<f64> = (0..12)
+            .map(|i| maps.iter().map(|m| m[i]).sum::<f64>() / draws as f64)
+            .collect();
+        let measured_bias: f64 = mean.iter().zip(&x).map(|(m, t)| (m - t).powi(2)).sum();
+        let measured_var: f64 = (0..12)
+            .map(|i| {
+                maps.iter().map(|m| (m[i] - mean[i]).powi(2)).sum::<f64>() / (draws - 1) as f64
+            })
+            .sum();
+        let (bias2, variance) = bias_variance(&g, &x, sigma, gamma);
+        assert!(
+            (measured_var - variance).abs() < 0.12 * variance,
+            "variance {measured_var} vs {variance}"
+        );
+        // The measured bias also carries the mean's own noise (variance / draws).
+        assert!(
+            (measured_bias - bias2).abs() < 0.1 * bias2 + 3.0 * variance / draws as f64,
+            "bias² {measured_bias} vs {bias2}"
         );
     }
 }

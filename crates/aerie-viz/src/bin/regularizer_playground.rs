@@ -8,7 +8,8 @@
 //! - **Trend filtering** (order 1): λ Σ_drones |(Lx)_i|, ADMM: straight pieces, few kinks.
 //! - **Total variation** (trend filtering of order 0): λ Σ_links √w |x_i − x_j|, ADMM: flat
 //!   pieces, sharp edges.
-//! - **Sparse local variation**: λ Σ_drones ‖∇_i x‖₂, ADMM: few drones see any change.
+//! - **Sparse total variation**: total variation + λ₂ Σ_drones |x_i|, ADMM: flat pieces,
+//!   most of the map exactly 0.
 //!
 //! - Left: a scenario (one made for each regularizer's strength, checked with real numbers,
 //!   or your own), the settings (graph, truth, sensors, noise), each regularizer on or off with
@@ -19,7 +20,7 @@
 //! - Right: the maths: the common shape, then each regularizer's penalty, how it is solved,
 //!   and its numbers at the selected drone; Tikhonov's matrices written out.
 
-use aerie_classic::regularize::{Reconstruction, Regularizer, local_variation, reconstruct};
+use aerie_classic::regularize::{Reconstruction, Regularizer, reconstruct};
 use aerie_graph::{Edge, EdgeList};
 use aerie_viz::grid::{Focus, fmt, matrix_grid, mix};
 use eframe::egui::{
@@ -82,14 +83,14 @@ enum Method {
     Tikhonov,
     TrendFiltering,
     TotalVariation,
-    SparseLocal,
+    SparseTv,
 }
 
 const METHODS: [Method; 4] = [
     Method::Tikhonov,
     Method::TrendFiltering,
     Method::TotalVariation,
-    Method::SparseLocal,
+    Method::SparseTv,
 ];
 
 impl Method {
@@ -102,7 +103,7 @@ impl Method {
             Method::Tikhonov => "Tikhonov",
             Method::TrendFiltering => "Trend filtering",
             Method::TotalVariation => "Total variation",
-            Method::SparseLocal => "Sparse local variation",
+            Method::SparseTv => "Sparse total variation",
         }
     }
 
@@ -111,23 +112,28 @@ impl Method {
             Method::Tikhonov => Color32::from_rgb(255, 180, 50),
             Method::TrendFiltering => Color32::from_rgb(90, 200, 140),
             Method::TotalVariation => Color32::from_rgb(225, 100, 180),
-            Method::SparseLocal => Color32::from_rgb(170, 130, 255),
+            Method::SparseTv => Color32::from_rgb(170, 130, 255),
         }
     }
 
     fn param(self) -> &'static str {
         match self {
             Method::Tikhonov => "γ",
+            Method::SparseTv => "λ₁",
             _ => "λ",
         }
     }
 
-    fn regularizer(self, p: f64) -> Regularizer {
+    /// The regularizer at parameter p (λ₂ is sparse total variation's second parameter).
+    fn regularizer(self, p: f64, lambda2: f64) -> Regularizer {
         match self {
             Method::Tikhonov => Regularizer::Tikhonov { gamma: p },
             Method::TrendFiltering => Regularizer::TrendFiltering { lambda: p },
             Method::TotalVariation => Regularizer::TotalVariation { lambda: p },
-            Method::SparseLocal => Regularizer::SparseLocalVariation { lambda: p },
+            Method::SparseTv => Regularizer::SparseTotalVariation {
+                lambda1: p,
+                lambda2,
+            },
         }
     }
 
@@ -136,7 +142,7 @@ impl Method {
             Method::Tikhonov => "γ Σ_links w (x_i − x_j)²",
             Method::TrendFiltering => "λ Σ_drones |(Lx)_i|",
             Method::TotalVariation => "λ Σ_links √w |x_i − x_j|",
-            Method::SparseLocal => "λ Σ_drones ‖∇_i x‖₂",
+            Method::SparseTv => "λ₁ Σ_links √w |x_i − x_j| + λ₂ Σ_drones |x_i|",
         }
     }
 
@@ -145,7 +151,7 @@ impl Method {
             Method::Tikhonov => "smooth slopes; squares the jumps, so it blurs edges",
             Method::TrendFiltering => "straight pieces joined at a few kinks",
             Method::TotalVariation => "flat pieces with sharp edges (stairs on slopes)",
-            Method::SparseLocal => "few drones see any change; the rest of each area flat",
+            Method::SparseTv => "flat pieces, and most of the map exactly 0",
         }
     }
 }
@@ -315,7 +321,7 @@ impl Truth {
             Truth::Bump => "smooth bump",
             Truth::Kinks => "slopes with kinks",
             Truth::Steps => "plateaus (steps)",
-            Truth::Disc => "a disc",
+            Truth::Disc => "a disc on a raised floor",
             Truth::Hotspots => "small hotspots",
             Truth::Jamming => "true jamming power",
         }
@@ -371,13 +377,13 @@ impl Truth {
                 .iter()
                 .map(|p| {
                     let r = 0.3 * w.max(h).max(1e-9);
-                    if h < 1e-9 {
-                        if (p[0] - cx).abs() < r { 1.0 } else { 0.0 }
-                    } else if d2(p, cx, cy) < r * r {
-                        1.0
+                    let inside = if h < 1e-9 {
+                        (p[0] - cx).abs() < r
                     } else {
-                        0.0
-                    }
+                        d2(p, cx, cy) < r * r
+                    };
+                    // On a floor of 0.4, not 0: two flat levels, neither of them 0.
+                    if inside { 1.0 } else { 0.4 }
                 })
                 .collect(),
             Truth::Hotspots => unit
@@ -439,7 +445,7 @@ enum Scenario {
     TikhonovCase,
     TrendCase,
     TvCase,
-    SlvCase,
+    StvCase,
     Custom,
 }
 
@@ -448,7 +454,7 @@ impl Scenario {
         Scenario::TikhonovCase,
         Scenario::TrendCase,
         Scenario::TvCase,
-        Scenario::SlvCase,
+        Scenario::StvCase,
         Scenario::Custom,
     ];
 
@@ -457,7 +463,9 @@ impl Scenario {
             Scenario::TikhonovCase => "Random smooth field: Tikhonov's case",
             Scenario::TrendCase => "Slopes with kinks: trend filtering's case",
             Scenario::TvCase => "A disc with a sharp edge: total variation's case",
-            Scenario::SlvCase => "The real jamming field: sparse local variation's case",
+            Scenario::StvCase => {
+                "Small hotspots on a quiet background: sparse total variation's case"
+            }
             Scenario::Custom => "Your own settings",
         }
     }
@@ -475,14 +483,17 @@ impl Scenario {
                  stairs; Tikhonov rounds the kinks."
             }
             Scenario::TvCase => {
-                "A flat disc on a flat floor, one sharp edge all around. Total variation keeps \
-                 it flat and the edge sharp; Tikhonov blurs the edge; trend filtering makes \
-                 a cone."
+                "A flat disc on a raised flat floor (1 on 0.4), one sharp edge all around. \
+                 Total variation keeps both levels flat and the edge sharp; Tikhonov blurs the \
+                 edge; trend filtering makes a cone; sparse total variation's λ₂ drags the \
+                 floor toward 0, which it isn't."
             }
-            Scenario::SlvCase => {
-                "Mission 3's real problem: the swarm's jamming field (sharp around the jammer, \
-                 flat far away) from the RF sensing drones, a third blinded. Sparse local \
-                 variation gives the lowest error."
+            Scenario::StvCase => {
+                "Three small hot patches, 0 everywhere else, a reading at every drone. Sparse \
+                 total variation keeps the patches flat and puts the background at exactly 0; \
+                 total variation leaves small levels everywhere, Tikhonov blurs the patches. \
+                 Careful: with few sensors, λ₂ pulls every drone without a sensor to 0 (try \
+                 the swarm with RF sensors only)."
             }
             Scenario::Custom => "Change anything below.",
         }
@@ -568,10 +579,12 @@ struct Playground {
     has_sensor: Vec<bool>,
     y: Vec<f64>,
     params: [f64; 4],
+    /// Sparse total variation's λ₂ (its λ₁ is in `params`).
+    lambda2: f64,
     shown: [bool; 4],
     iterations: usize,
     results: [Option<Reconstruction>; 4],
-    result_for: [Option<(u64, u64, usize)>; 4],
+    result_for: [Option<(u64, u64, u64, usize)>; 4],
     tuning: Option<Tuning>,
     selected: usize,
     hover: Option<usize>,
@@ -598,6 +611,7 @@ impl Default for Playground {
             has_sensor: Vec::new(),
             y: Vec::new(),
             params: [1.0, 0.1, 0.1, 0.1],
+            lambda2: 0.05,
             shown: [true; 4],
             iterations: 800,
             results: [None, None, None, None],
@@ -682,13 +696,13 @@ impl Playground {
                 0.5,
                 [0.22, 0.046, 0.1, 0.1],
             ),
-            Scenario::SlvCase => (
-                GraphKind::Swarm,
-                Truth::Jamming,
-                SensorRule::RfDrones,
+            Scenario::StvCase => (
+                GraphKind::Grid,
+                Truth::Hotspots,
+                SensorRule::Share,
                 1.0,
-                0.2,
-                [0.001, 0.001, 0.001, 0.001],
+                0.5,
+                [0.1, 0.022, 0.046, 0.022],
             ),
             Scenario::Custom => return,
         };
@@ -698,6 +712,7 @@ impl Playground {
         self.share = share;
         self.noise = noise;
         self.params = params;
+        self.lambda2 = if s == Scenario::StvCase { 0.1 } else { 0.05 };
         // The random smooth field's draw (and the swarm's seed for the others).
         self.seed = if s == Scenario::TikhonovCase { 11 } else { 0 };
         self.sensor_seed = 1;
@@ -773,13 +788,18 @@ impl Playground {
                 self.result_for[i] = None;
                 continue;
             }
-            let key = (self.version, self.params[i].to_bits(), self.iterations);
+            let key = (
+                self.version,
+                self.params[i].to_bits(),
+                self.lambda2.to_bits(),
+                self.iterations,
+            );
             if self.result_for[i] != Some(key) {
                 self.results[i] = Some(reconstruct(
                     &self.world.graph,
                     &self.y,
                     &self.has_sensor,
-                    m.regularizer(self.params[i]),
+                    m.regularizer(self.params[i], self.lambda2),
                     self.iterations,
                 ));
                 self.result_for[i] = Some(key);
@@ -816,7 +836,14 @@ impl Playground {
             param_grid()
                 .into_iter()
                 .map(|p| {
-                    let x = reconstruct(g, &self.y, &kept, m.regularizer(p), self.iterations).x;
+                    let x = reconstruct(
+                        g,
+                        &self.y,
+                        &kept,
+                        m.regularizer(p, self.lambda2),
+                        self.iterations,
+                    )
+                    .x;
                     let error = if by_truth {
                         nmse(&x, &self.truth, |_| true)
                     } else {
@@ -958,6 +985,13 @@ impl Playground {
                         .logarithmic(true)
                         .text(m.param()),
                 );
+                if m == Method::SparseTv {
+                    ui.add(
+                        egui::Slider::new(&mut self.lambda2, PARAM_MIN..=10.0)
+                            .logarithmic(true)
+                            .text("λ₂ (sparsity)"),
+                    );
+                }
             }
         }
         ui.add(
@@ -1242,26 +1276,40 @@ impl Playground {
             mono(ui, &format!("drone {i}'s links: {}", mine.join(", ")));
             self.loop_line(ui, m);
         }
-        // Sparse local variation.
-        if let Some(x) = self.map(Method::SparseLocal) {
-            let m = Method::SparseLocal;
-            section(ui, "Sparse local variation", m.color());
-            mono(ui, "x̂ = argmin ½‖M(x − y)‖² + λ Σ_i ‖∇_i x‖₂");
+        // Sparse total variation.
+        if let Some(x) = self.map(Method::SparseTv) {
+            let m = Method::SparseTv;
+            section(ui, "Sparse total variation", m.color());
+            mono(ui, "x̂ = argmin ½‖M(x − y)‖² + λ₁ ‖Bᵀx‖₁ + λ₂ ‖x‖₁");
             ui.weak(
-                "∇_i x lists √w (x_j − x_i) over drone i's links; ‖∇_i x‖₂ is its local \
-                 variation, one number per drone. The penalty shrinks each drone's whole \
-                 neighbourhood at once: a quiet drone becomes exactly flat around itself.",
+                "Total variation plus a second |·| on the values themselves: the jumps are \
+                 shrunk link by link (flat pieces) and the values drone by drone (most of the \
+                 map exactly 0). Two helper variables, one per link and one per drone:",
             );
-            mono(ui, "x ← solve (MᵀM + 2ρL) x = MᵀM y + ρ Dᵀ(z − u)");
             mono(
                 ui,
-                "z_i ← max(0, 1 − (λ/ρ)/‖v_i‖) · v_i,   v_i = ∇_i x + u_i",
+                "x  ← solve (MᵀM + ρ(L + I)) x = MᵀM y + ρB(z₁ − u₁) + ρ(z₂ − u₂)",
             );
-            mono(ui, "u ← u + Dx − z");
-            let lv = local_variation(g, x);
-            let busy = lv.iter().filter(|v| **v > tiny).count();
-            mono(ui, &format!("drones that see change: {busy} of {n}"));
-            mono(ui, &format!("drone {i}: ‖∇_{i} x‖₂ = {}", fmt(lv[i])));
+            mono(ui, "z₁ ← soft_threshold(Bᵀx + u₁, λ₁/ρ)   link by link");
+            mono(ui, "z₂ ← soft_threshold(x + u₂, λ₂/ρ)      drone by drone");
+            mono(ui, "u₁ ← u₁ + Bᵀx − z₁,   u₂ ← u₂ + x − z₂");
+            let zeros = x.iter().filter(|v| v.abs() <= tiny).count();
+            let jumping = g
+                .edges
+                .iter()
+                .filter(|e| {
+                    (e.weight.sqrt() * (x[e.src as usize] - x[e.dst as usize])).abs() > tiny
+                })
+                .count();
+            mono(ui, &format!("drones exactly 0: {zeros} of {n}"));
+            mono(
+                ui,
+                &format!("links with a jump: {jumping} of {}", g.edges.len()),
+            );
+            mono(
+                ui,
+                &format!("λ₂ = {}   drone {i}: x̂ = {}", fmt(self.lambda2), fmt(x[i])),
+            );
             self.loop_line(ui, m);
         }
         ui.add_space(4.0);
@@ -1956,7 +2004,14 @@ mod tests {
         param_grid()
             .into_iter()
             .map(|q| {
-                let x = reconstruct(&p.world.graph, &p.y, &p.has_sensor, m.regularizer(q), 800).x;
+                let x = reconstruct(
+                    &p.world.graph,
+                    &p.y,
+                    &p.has_sensor,
+                    m.regularizer(q, p.lambda2),
+                    800,
+                )
+                .x;
                 nmse(&x, &p.truth, |_| true)
             })
             .fold(f64::MAX, f64::min)
@@ -1972,7 +2027,7 @@ mod tests {
             (Scenario::TikhonovCase, Method::Tikhonov),
             (Scenario::TrendCase, Method::TrendFiltering),
             (Scenario::TvCase, Method::TotalVariation),
-            (Scenario::SlvCase, Method::SparseLocal),
+            (Scenario::StvCase, Method::SparseTv),
         ] {
             let mut p = Playground::default();
             p.apply(s);
@@ -1994,7 +2049,7 @@ mod tests {
             (Scenario::TikhonovCase, Method::Tikhonov),
             (Scenario::TrendCase, Method::TrendFiltering),
             (Scenario::TvCase, Method::TotalVariation),
-            (Scenario::SlvCase, Method::SparseLocal),
+            (Scenario::StvCase, Method::SparseTv),
         ] {
             let mut p = Playground::default();
             p.apply(s);

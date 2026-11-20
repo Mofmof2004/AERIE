@@ -13,7 +13,7 @@ pub struct Gui {
 }
 
 /// Every GUI, in menu order.
-pub const GUIS: [Gui; 13] = [
+pub const GUIS: [Gui; 14] = [
     Gui {
         bin: "swarm_viewer",
         title: "Swarm viewer",
@@ -77,7 +77,12 @@ pub const GUIS: [Gui; 13] = [
     Gui {
         bin: "regularizer_playground",
         title: "Regularizer playground",
-        about: "Tikhonov, trend filtering, total variation, sparse local variation side by side (Mission 3).",
+        about: "Tikhonov, trend filtering, total variation, sparse total variation side by side (Mission 3).",
+    },
+    Gui {
+        bin: "bias_variance_playground",
+        title: "Bias–variance playground",
+        about: "Experiment 1: bias², variance and total against γ, theory and simulated draws (Mission 3).",
     },
 ];
 

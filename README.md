@@ -42,7 +42,7 @@ AERIE/
 │   │       ├── m2.rs       the Mission 2 experiment: run_seed (DeepWalk, Node2Vec at each (p, q), three scores, baselines), sweep, CSV
 │   │       └── embed/      Mission 2 embeddings: walks.rs (random_walks), skipgram.rs (pair_loss_and_grads, train_skipgram), deepwalk.rs (deepwalk), node2vec.rs (biased_walks, node2vec), mf.rs (matrix_factorization), score.rs (role F1, link AUC, squad NMI)
 │   └── aerie-viz/          GUIs (egui): one binary per GUI in src/bin/; shared map.rs, m1_view.rs (Mission 1 view), m1_plot.rs (results plot), m2_view.rs (Mission 2 view, chart, runner)
-│       └── src/bin/        swarm_viewer.rs, graph_playground.rs, jamming_playground.rs, matrix_playground.rs, lp_playground.rs, m1_results.rs, m2_results.rs, skipgram_playground.rs, node2vec_playground.rs, mf_playground.rs, graph_matrices_playground.rs, signal_playground.rs, regularizer_playground.rs
+│       └── src/bin/        swarm_viewer.rs, graph_playground.rs, jamming_playground.rs, matrix_playground.rs, lp_playground.rs, m1_results.rs, m2_results.rs, skipgram_playground.rs, node2vec_playground.rs, mf_playground.rs, graph_matrices_playground.rs, signal_playground.rs, regularizer_playground.rs, bias_variance_playground.rs
 └── target/                 build output (not committed)
 ```
 
@@ -100,6 +100,7 @@ Always use `--release` for the GUIs: they are much smoother.
 | Graph matrices playground | `cargo run --release -p aerie-viz --bin graph_matrices_playground` |
 | Signal playground | `cargo run --release -p aerie-viz --bin signal_playground` |
 | Regularizer playground | `cargo run --release -p aerie-viz --bin regularizer_playground` |
+| Bias–variance playground | `cargo run --release -p aerie-viz --bin bias_variance_playground` |
 
 ### Swarm viewer
 
@@ -461,15 +462,16 @@ its own way:
 | Tikhonov | γ Σ_links w (x_i − x_j)², one solve | smooth slopes (blurs edges) |
 | Trend filtering (order 1) | λ Σ_drones \|(Lx)_i\|, ADMM | straight pieces joined at a few kinks |
 | Total variation (order 0) | λ Σ_links √w \|x_i − x_j\|, ADMM | flat pieces, sharp edges (stairs on slopes) |
-| Sparse local variation | λ Σ_drones ‖∇_i x‖₂, ADMM | few drones see change, the rest of each area flat |
+| Sparse total variation | λ₁ Σ_links √w \|x_i − x_j\| + λ₂ Σ_drones \|x_i\|, ADMM | flat pieces, most of the map exactly 0 |
 
 - **Left:** a scenario made for each regularizer, checked with real numbers (each wins its own
   with its best parameter): a random smooth field on a path (Tikhonov), slopes with kinks
-  (trend filtering), a disc with a sharp edge on a grid (total variation), the swarm's real
-  jamming field from the RF sensing drones (sparse local variation); or your own settings
+  (trend filtering), a disc on a raised floor on a grid (total variation), small hotspots on a
+  quiet background (sparse total variation: with few sensors its λ₂ pulls every drone without a
+  sensor to 0, so it does badly on the swarm with RF sensors only); or your own settings
   (graph: tiny path, path of 40, 12 × 12 grid, swarm; truth: random smooth, bump, kinks,
   steps, disc, hotspots, jamming; sensors; noise). Each regularizer on or off with its
-  parameter, the ADMM rounds, what the maps show. Results: each one's NMSE (the best in bold),
+  parameter (sparse total variation has two: λ₁ for the jumps, λ₂ for sparsity), the ADMM rounds, what the maps show. Results: each one's NMSE (the best in bold),
   *Tune every parameter* by the truth or by 20 % held-out sensors (curves, bests, *Use these
   parameters*), and the ADMM loops' convergence.
 - **Centre:** one map per regularizer (up to 2 × 2), titled with its parameter and NMSE;
@@ -479,7 +481,29 @@ its own way:
   favour; Tikhonov written out (L, K, b, x̂ and truth for the selected drone's block, and its
   row solved by hand, ✔ against the solver); for each ADMM method its three steps and its
   numbers: drones with a bend (trend filtering), links with a jump (total variation), drones
-  that see change (sparse local variation), and the selected drone's values.
+  exactly 0 and links with a jump (sparse total variation), and the selected drone's values.
+
+### Bias–variance playground
+
+Mission 3's experiment 1: how Tikhonov's γ trades noise for blur. A noisy reading at every
+drone, y = x + noise (σ), x̂ = H y with H = (I + γL)⁻¹: bias = (H − I) x (the blur, the same on
+every draw), variance = σ² trace(H Hᵀ) (the noise that survives), expected error = bias² +
+variance. The theory comes from `aerie_classic::regularize::bias_variance`.
+
+- **Left:** the graph (a tiny path of 6 where H is written out, a path of 40, a 12 × 12 grid,
+  the swarm's ε-graph), the truth (bump, sharp edge, kinks, the swarm's jamming power), σ, γ,
+  the number of simulated draws, *New noise*, and **Run experiment 1**: the plan's 20 values of
+  γ (0.001 to 100) with the draws at each, measured bias², variance and total as dots. What the
+  map shows: the truth, the average map Hx, each drone's bias or variance, one noisy draw, or
+  its map.
+- **Right:** the three curves against γ (theory as lines, simulation as dots, the lowest
+  total marked, click to set γ), theory against the draws at this γ, and the maths with live
+  numbers: H as a smoothing matrix (the selected drone's row: its weights, adding up to 1; H
+  in full on the tiny path), E[x̂] = Hx and the bias, Cov(x̂) = σ² H Hᵀ and the variance, the
+  total and its two ends (γ = 0: variance n σ²; γ → ∞: variance σ², bias² Σ (x_i − mean)²).
+- **Bottom:** along the path, the truth, the average map, a ±2 standard deviation band, a few
+  single reconstructions and one draw's readings (off the path, the average map against the
+  truth with its band).
 
 ### Jamming playground
 
