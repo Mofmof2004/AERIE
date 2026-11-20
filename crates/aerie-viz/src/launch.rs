@@ -13,7 +13,7 @@ pub struct Gui {
 }
 
 /// Every GUI, in menu order.
-pub const GUIS: [Gui; 9] = [
+pub const GUIS: [Gui; 10] = [
     Gui {
         bin: "swarm_viewer",
         title: "Swarm viewer",
@@ -58,6 +58,11 @@ pub const GUIS: [Gui; 9] = [
         bin: "node2vec_playground",
         title: "Node2Vec playground",
         about: "Bend the walks with p and q, step by step; build graphs, paint labels (Mission 2).",
+    },
+    Gui {
+        bin: "mf_playground",
+        title: "Matrix factorisation playground",
+        about: "Watch Z Zᵀ rebuild A epoch by epoch, with the math; hide links (Mission 2).",
     },
 ];
 

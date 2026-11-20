@@ -40,9 +40,9 @@ AERIE/
 │   │       ├── eval.rs     Method, Problem, draw_reporters, hide, guesses, Score, score
 │   │       ├── m1.rs       the Mission 1 experiment: LabelKind, GraphKind, sweep (seeds in parallel), CSV, tables
 │   │       ├── m2.rs       the Mission 2 experiment: run_seed (DeepWalk, Node2Vec at each (p, q), three scores, baselines), sweep, CSV
-│   │       └── embed/      Mission 2 embeddings: walks.rs (random_walks), skipgram.rs (pair_loss_and_grads, train_skipgram), deepwalk.rs (deepwalk), node2vec.rs (biased_walks, node2vec), score.rs (role F1, link AUC, squad NMI)
+│   │       └── embed/      Mission 2 embeddings: walks.rs (random_walks), skipgram.rs (pair_loss_and_grads, train_skipgram), deepwalk.rs (deepwalk), node2vec.rs (biased_walks, node2vec), mf.rs (matrix_factorization), score.rs (role F1, link AUC, squad NMI)
 │   └── aerie-viz/          GUIs (egui): one binary per GUI in src/bin/; shared map.rs, m1_view.rs (Mission 1 view), m1_plot.rs (results plot), m2_view.rs (Mission 2 view, chart, runner)
-│       └── src/bin/        swarm_viewer.rs, graph_playground.rs, jamming_playground.rs, matrix_playground.rs, lp_playground.rs, m1_results.rs, m2_results.rs, skipgram_playground.rs, node2vec_playground.rs
+│       └── src/bin/        swarm_viewer.rs, graph_playground.rs, jamming_playground.rs, matrix_playground.rs, lp_playground.rs, m1_results.rs, m2_results.rs, skipgram_playground.rs, node2vec_playground.rs, mf_playground.rs
 └── target/                 build output (not committed)
 ```
 
@@ -78,7 +78,7 @@ Small programs in `crates/swarmsim/examples/`. Run with `--release`.
 | Link stats | `cargo run --release -p swarmsim --example link_stats` | link-model calibration (D03): for several N0 and scale settings, links lost, live degree, far links kept, zone links kept, splits, stranded drones, one-way counts |
 | Jamming stats | `cargo run --release -p swarmsim --example jamming_stats` | step 2 end to end, one row per seed: jammed share, relays jammed, links lost, pieces, stranded drones, readings on the wrong side; then the summary (D02) |
 | Mission 1 runner | `cargo run --release -p aerie-classic --example m1` | about 1 minute (seeds in parallel). The swarm viewer's Mission 1 view runs the same sweep with a button. Every method (majority, nearest km, nearest hops, LP, RWR α 0.85) on every graph (live, ε, kNN), for every label (zone, squad, role), report share (1 % to 50 %) and share of wrong reports (0, 10, 25, 40 % of the reporters say a wrong class), test seeds 90–99 × 20 draws. Prints the main table (live graph, 10 %), experiment 1 and the wrong-reports tables (accuracy, and the share of lies each method overruled); writes `results/m1/runs.csv` and `results/m1/summary.csv`. No guess counts as wrong. |
-| Mission 2 runner | `cargo run --release -p aerie-classic --example m2` | about 5 seconds (seeds in parallel). The swarm viewer's Mission 2 view runs the same with a button. DeepWalk and Node2Vec at p = 1, q = 0.5 and q = 2 (experiment 1; default walk and skip-gram settings) on the 300-drone traffic graph, test seeds 90–99, scored three ways: role macro-F1 (5-fold logistic regression), link AUC (10 % of the links hidden before training), squad NMI (k-means, k = 30). Baselines: random vectors, traffic counts (sent, received, partners; role only), majority class. Prints the table and the training pairs per epoch; writes `results/m2/embeddings.csv`. |
+| Mission 2 runner | `cargo run --release -p aerie-classic --example m2` | about 8 seconds (seeds in parallel). The swarm viewer's Mission 2 view runs the same with a button. DeepWalk, Node2Vec at p = 1, q = 0.5 and q = 2 (experiment 1; default walk and skip-gram settings) and matrix factorisation of A = ln(1 + messages) on the 300-drone traffic graph, test seeds 90–99, scored three ways: role macro-F1 (5-fold logistic regression), link AUC (10 % of the links hidden before training), squad NMI (k-means, k = 30). Baselines: random vectors, traffic counts (sent, received, partners; role only), majority class. Prints the table and the training pairs per epoch; writes `results/m2/embeddings.csv`. |
 
 ## GUIs
 
@@ -96,6 +96,7 @@ Always use `--release` for the GUIs: they are much smoother.
 | Mission 2 results | `cargo run --release -p aerie-viz --bin m2_results` |
 | Skip-gram playground | `cargo run --release -p aerie-viz --bin skipgram_playground` |
 | Node2Vec playground | `cargo run --release -p aerie-viz --bin node2vec_playground` |
+| Matrix factorisation playground | `cargo run --release -p aerie-viz --bin mf_playground` |
 
 ### Swarm viewer
 
@@ -294,7 +295,7 @@ runner does.
 
 - **Left:** DeepWalk's settings (walks per drone, walk length, dimension, window, negatives,
   epochs, learning rate; *Plan's settings* resets them), Node2Vec's p and q (same walk and
-  skip-gram settings; it runs next to DeepWalk), *Map uses* DeepWalk or Node2Vec, and what the
+  skip-gram settings; it runs next to DeepWalk), *Map uses* DeepWalk, Node2Vec or MF (matrix factorisation, run on every seed too), and what the
   map shows: **k-means
   clusters of Z** (each cluster in the colour of the squad most of its drones belong to; ring =
   true squad; cross = the drone's cluster is led by another squad), true squads, **role guessed
@@ -384,6 +385,30 @@ step (same neighbour order, one random number per step): with p = q = 1 they are
   pictures (PCA above dim 2).
 - **Bottom:** the walk being built and 4 walks from the start drone for each method, as chips
   in label colours; the arrow before each chip is the kind of step (↩ = back).
+
+### Matrix factorisation playground
+
+Watch Z Zᵀ learn to rebuild A. The trainer runs `matrix_factorization` epoch by epoch (same
+start, `mf_gradient`, `mf_loss`); at the last epoch it re-runs it and shows ✔ if both give the
+same Z.
+
+- **Left:** the same presets and tools as the Node2Vec playground, plus ✂ **Hide** (click two
+  linked drones: the link is 0 in A during training but kept for the link test). What A holds
+  (1 per link, ln(1 + weight), the weight), the settings (dimension, learning rate, l2, epochs,
+  seed: any change starts over), and training: with **Explain each epoch in 7 small steps** on,
+  Space follows one drone u (right-click to pick it) through one epoch; *Whole epoch*, *+10*,
+  *+100*, *Train to the end*, *Play*, *Reset*. A too-big learning rate is caught ("the loss
+  blew up").
+- **Centre left:** the graph. Small step 2 lights u's links with their A values; from step 3 a
+  line to every other drone, then coloured by its error (green: z_u · z_v too small, pulled
+  closer; red: too big, pushed away), as wide as the error.
+- **Centre right:** the vectors (dim 2: themselves; above: their two main directions) with the
+  origin, u's pull / push arrows and the step (magnified), and where u was before the step.
+- **Right:** **Math** (u's row of A, every z_u · z_v, every e_uv, every 4 e_uv z_v, the gradient
+  written out, the step and the loss before and after; largest errors first), **Matrices** (A,
+  Z Zᵀ and E = Z Zᵀ − A as heatmaps, drones sorted by label), **Hidden links** (each hidden
+  link's z_u · z_v, the share of never-linked pairs it beats, and the AUC).
+- **Bottom:** the loss per epoch, log scale.
 
 ### Jamming playground
 
